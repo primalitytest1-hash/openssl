@@ -1,263 +1,84 @@
-Welcome to the OpenSSL Project
-==============================
-
-[![openssl logo]][www.openssl.org]
+# Artifact Evaluation: High-Efficiency Natively Branchless Primality Testing against Structural Leakage
 
-[![github actions ci badge]][github actions ci]
-[![Nightly OS Zoo ci badge](https://github.com/openssl/openssl/actions/workflows/os-zoo.yml/badge.svg)](https://github.com/openssl/openssl/actions/workflows/os-zoo.yml)
-[![Provider Compatibility](https://github.com/openssl/openssl/actions/workflows/provider-compatibility.yml/badge.svg)](https://github.com/openssl/openssl/actions/workflows/provider-compatibility.yml)
-[![Quic Interop](https://github.com/openssl/openssl/actions/workflows/run_quic_interop.yml/badge.svg)](https://github.com/openssl/openssl/actions/workflows/run_quic_interop.yml)
-[![Daily checks](https://github.com/openssl/openssl/actions/workflows/run-checker-daily.yml/badge.svg)](https://github.com/openssl/openssl/actions/workflows/run-checker-daily.yml)
-[![LFX Health Score](https://insights.linuxfoundation.org/api/badge/health-score?project=openssl)](https://insights.linuxfoundation.org/project/openssl)
+This repository contains the source code, custom implementations, and benchmarking suites required to reproduce the experimental results presented in **Section 6** and **Appendix H** of our paper. It provides the tools to evaluate the correctness, performance, and side-channel resilience of our proposed natively branchless primality tests: **HVL** and **HVSS**.
 
-OpenSSL is a robust, commercial-grade, full-featured Open Source Toolkit
-for the Transport Layer Security (TLS, formerly SSL), Datagram TLS (DTLS), and QUIC protocols.
-
-The protocol implementations are based on a full-strength general purpose
-cryptographic library, which can also be used stand-alone. Also included is a
-cryptographic module validated to conform with FIPS standards.
-
-OpenSSL is descended from the SSLeay library developed by Eric A. Young
-and Tim J. Hudson.
-
-The official Home Page of the OpenSSL Project is [www.openssl.org].
-
-Table of Contents
-=================
-
- - [Overview](#overview)
- - [Download](#download)
- - [Build and Install](#build-and-install)
- - [Documentation](#documentation)
- - [License](#license)
- - [Support](#support)
- - [Contributing](#contributing)
- - [Legalities](#legalities)
+## 1. Overview of the Experiments
 
-Overview
-========
-
-The OpenSSL toolkit includes:
+As detailed in the paper, our experimental evaluation is divided into two primary domains to prove both the efficiency and the structural security of our architectures:
 
-- **libssl**
-  an implementation of all TLS protocol versions up to TLSv1.3 ([RFC 8446]),
-  DTLS protocol versions up to DTLSv1.2 ([RFC 6347]) and
-  the QUIC version 1 protocol ([RFC 9000]).
+1. **Performance and Correctness Verification (Section 6.1 & 6.2):** Evaluates the functional equivalence and execution latencies of our branchless implementations (HVL and HVSS) against the native OpenSSL Miller-Rabin (MR), a constant-time Miller-Rabin (MR-FP), and a constant-time Solovay-Strassen (SS) baseline. The outputs correspond directly to **Figure 2** and **Table 4** in the paper.
+2. **Constant-Time Leakage Assessment (Section 6.2 & Appendix H):** Utilizes the `dudect` framework to rigorously verify the constant-time execution of our algorithms over 600,000 timing measurements. The tests assess three distinct leakage vectors (Fixed vs. Pool, Pool vs. Pool, Prime vs. Composite) to ensure the maximum Welch's t-statistic remains strictly within the +/- 4.5 safety threshold. This corresponds to **Figure 1** (ARM64) and **Figure 4** (x86_64).
 
-- **libcrypto**
-  a full-strength general purpose cryptographic library. It constitutes the
-  basis of the TLS implementation, but can also be used independently.
+> **Prerequisite:** Before running any of the tests below, please ensure that you have successfully configured and compiled the modified OpenSSL library (`libcrypto.a`) in the root directory.
 
-- **openssl**
-  the OpenSSL command line tool, a swiss army knife for cryptographic tasks,
-  testing and analyzing. It can be used for
-  - creation of key parameters
-  - creation of X.509 certificates, CSRs and CRLs
-  - calculation of message digests
-  - encryption and decryption
-  - SSL/TLS/DTLS and client and server tests
-  - QUIC client tests
-  - handling of S/MIME signed or encrypted mail
-  - and more...
-
-Download
-========
+---
 
-For Production Use
-------------------
+## 2. Correctness and Performance Benchmark (Section 6.1 & 6.2)
 
-Source code tarballs of the official releases can be downloaded from
-[openssl-library.org/source/](https://openssl-library.org/source/).
-The OpenSSL project does not distribute the toolkit in binary form.
+This suite executes the functional equivalence verifications across all five algorithms and measures their execution times across different prime bit-lengths (1024, 1536, and 2048-bit). 
 
-However, for a large variety of operating systems precompiled versions
-of the OpenSSL toolkit are available. In particular, on Linux and other
-Unix operating systems, it is normally recommended to link against the
-precompiled shared libraries provided by the distributor or vendor.
+### Compilation
+Navigate to the root directory of the repository and compile the benchmark harness:
+```bash
+gcc -O2 test_prime_tests.c -I./include ./libcrypto.a -lpthread -ldl -o test_prime_tests
+```
 
-We also maintain a list of third parties that produce OpenSSL binaries for
-various Operating Systems (including Windows) on the [Binaries] page on our
-wiki.
+### Execution
+Run the compiled benchmark:
+```bash
+./test_prime_tests
+```
+*The terminal output will display the absolute execution times (in microseconds) and the normalized performance overheads relative to the vulnerable baseline, directly reproducing the data for Table 4 and Figure 2.*
 
-For Testing and Development
----------------------------
+---
 
-Although testing and development could in theory also be done using
-the source tarballs, having a local copy of the git repository with
-the entire project history gives you much more insight into the
-code base.
+## 3. Constant-Time Leakage Assessment (dudect)
 
-The main OpenSSL Git repository is private.
-There is a public GitHub mirror of it at [github.com/openssl/openssl],
-which is updated automatically from the former on every commit.
+We integrate the `dudect` framework to perform rigorous side-channel leakage assessments. 
 
-A local copy of the Git repository can be obtained by cloning it from
-the GitHub mirror using
+### Compilation
+Navigate to the `my_tests` directory and compile the leakage assessment tool:
+```bash
+cd my_tests/
+gcc -O2 test_all_ct.c -o test_all_ct -I../include -I./dudect/src ../libcrypto.a -lm
+```
 
-    git clone https://github.com/openssl/openssl.git
+### Execution
+Execute the side-channel test:
+```bash
+./test_all_ct
+```
+*The tool will compute Welch's t-test statistic. A maximum t-statistic value of `< 4.5` indicates no statistically significant timing leakage.*
 
-If you intend to contribute to OpenSSL, either to fix bugs or contribute
-new features, you need to fork the GitHub mirror and clone your public fork
-instead.
+---
 
-    git clone https://github.com/yourname/openssl.git
+## 4. Cross-Platform Configuration (ARM64 vs. x86_64)
 
-This is necessary because all development of OpenSSL nowadays is done via
-GitHub pull requests. For more details, see [Contributing](#contributing).
+To demonstrate that our branchless design's side-channel resilience is independent of specific microarchitectures, we evaluated it on both ARM64 and x86_64 platforms. 
 
-Build and Install
-=================
+By default, the `dudect` environment in this repository is configured to read cycle counts for **ARM64** (e.g., Apple M-series processors). To reproduce the x86_64 evaluations presented in **Appendix H**, you must modify the CPU cycle counter configuration.
 
-After obtaining the Source, have a look at the [INSTALL](INSTALL.md) file for
-detailed instructions about building and installing OpenSSL. For some
-platforms, the installation instructions are amended by a platform specific
-document.
+### Switching to x86_64
+1. Open the file `dudect/src/cpucycles.h`.
+2. Locate the `cpucycles()` function definition.
+3. Replace the ARM64 inline assembly with the x86_64 `rdtsc` instruction implementation.
 
- * [Notes for UNIX-like platforms](NOTES-UNIX.md)
- * [Notes for Android platforms](NOTES-ANDROID.md)
- * [Notes for Windows platforms](NOTES-WINDOWS.md)
- * [Notes for the DOS platform with DJGPP](NOTES-DJGPP.md)
- * [Notes for the OpenVMS platform](NOTES-VMS.md)
- * [Notes on Perl](NOTES-PERL.md)
- * [Notes on Valgrind](NOTES-VALGRIND.md)
+**For ARM64 (Default):**
+```c
+static inline int64_t cpucycles(void) {
+    int64_t val;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+}
+```
 
-Specific notes on upgrading to OpenSSL 3.x from previous versions can be found
-in the [ossl-guide-migration(7ossl)] manual page.
+**For x86_64 (Appendix H Reproduction):**
+```c
+static inline int64_t cpucycles(void) {
+    unsigned int hi, lo;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((int64_t)lo) | (((int64_t)hi) << 32);
+}
+```
 
-Documentation
-=============
-
-README Files
-------------
-
-There are some README.md files in the top level of the source distribution
-containing additional information on specific topics.
-
- * [Information about the OpenSSL QUIC protocol implementation](README-QUIC.md)
- * [Information about the OpenSSL Provider architecture](README-PROVIDERS.md)
- * [Information about using the OpenSSL FIPS validated module](README-FIPS.md)
-
-The OpenSSL Guide
------------------
-
-There are some tutorial and introductory pages on some important OpenSSL topics
-within the [OpenSSL Guide].
-
-Manual Pages
-------------
-
-The manual pages for the master branch and all current stable releases are
-available online.
-
-- [OpenSSL master](https://docs.openssl.org/master/)
-- [OpenSSL 3.6](https://docs.openssl.org/3.6/)
-- [OpenSSL 3.5](https://docs.openssl.org/3.5/)
-- [OpenSSL 3.4](https://docs.openssl.org/3.4/)
-- [OpenSSL 3.3](https://docs.openssl.org/3.3/)
-- [OpenSSL 3.2](https://docs.openssl.org/3.2/)
-- [OpenSSL 3.0](https://docs.openssl.org/3.0/)
-
-Demos
------
-
-There are numerous source code demos for using various OpenSSL capabilities in the
-[demos subfolder](./demos).
-
-Wiki
-----
-
-There is a [GitHub Wiki] which is currently not very active.
-
-License
-=======
-
-OpenSSL is licensed under the Apache License 2.0, which means that
-you are free to get and use it for commercial and non-commercial
-purposes as long as you fulfill its conditions.
-
-See the [LICENSE.txt](LICENSE.txt) file for more details.
-
-Support
-=======
-
-There are various ways to get in touch. The correct channel depends on
-your requirement. See the [SUPPORT](SUPPORT.md) file for more details.
-
-Contributing
-============
-
-If you are interested and willing to contribute to the OpenSSL project,
-please take a look at the [CONTRIBUTING](CONTRIBUTING.md) file.
-
-Legalities
-==========
-
-A number of nations restrict the use or export of cryptography. If you are
-potentially subject to such restrictions, you should seek legal advice before
-attempting to develop or distribute cryptographic code.
-
-Copyright
-=========
-
-Copyright (c) 1998-2026 The OpenSSL Project Authors
-
-Copyright (c) 1995-1998 Eric A. Young, Tim J. Hudson
-
-All rights reserved.
-
-<!-- Links  -->
-
-[www.openssl.org]:
-    <https://www.openssl.org>
-    "OpenSSL Homepage"
-
-[github.com/openssl/openssl]:
-    <https://github.com/openssl/openssl>
-    "OpenSSL GitHub Mirror"
-
-[GitHub Wiki]:
-    <https://github.com/openssl/openssl/wiki>
-    "OpenSSL Wiki"
-
-[ossl-guide-migration(7ossl)]:
-    <https://docs.openssl.org/master/man7/ossl-guide-migration>
-    "OpenSSL Migration Guide"
-
-[RFC 8446]:
-     <https://tools.ietf.org/html/rfc8446>
-
-[RFC 6347]:
-     <https://tools.ietf.org/html/rfc6347>
-
-[RFC 9000]:
-     <https://tools.ietf.org/html/rfc9000>
-
-[Binaries]:
-    <https://github.com/openssl/openssl/wiki/Binaries>
-    "List of third party OpenSSL binaries"
-
-[OpenSSL Guide]:
-    <https://docs.openssl.org/master/man7/ossl-guide-introduction>
-    "An introduction to OpenSSL"
-
-<!-- Logos and Badges -->
-
-[openssl logo]:
-    doc/images/openssl.svg
-    "OpenSSL Logo"
-
-[github actions ci badge]:
-    <https://github.com/openssl/openssl/workflows/GitHub%20CI/badge.svg>
-    "GitHub Actions CI Status"
-
-[github actions ci]:
-    <https://github.com/openssl/openssl/actions/workflows/ci.yml>
-    "GitHub Actions CI"
-
-[appveyor badge]:
-    <https://ci.appveyor.com/api/projects/status/8e10o7xfrg73v98f/branch/master?svg=true>
-    "AppVeyor Build Status"
-
-[appveyor jobs]:
-    <https://ci.appveyor.com/project/openssl/openssl/branch/master>
-    "AppVeyor Jobs"
+*After updating the cycle counter, recompile the `test_all_ct.c` binary on your x86_64 machine and execute it to reproduce the results in Figure 4.*

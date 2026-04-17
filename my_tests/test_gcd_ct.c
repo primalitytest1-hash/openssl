@@ -7,31 +7,31 @@
 #define DUDECT_IMPLEMENTATION
 #include "dudect/src/dudect.h"
 
-/* 🔥 宣告你的 GCD/Inversion 實作與記憶體擴展工具 */
+/* 🔥 Declare your GCD/Inversion implementation and memory expansion tool */
 extern void ct_by_gcd_inv(BIGNUM *out_inv, BIGNUM *out_gcd, const BIGNUM *x, const BIGNUM *m, int top_w, BN_CTX *ctx);
 extern BIGNUM *bn_wexpand(BIGNUM *a, int words);
 
-/* 測試參數設定 */
-#define BIT_LENGTH 1024         /* 測試位元數 */
-#define POOL_SIZE 1000          /* 池子大小 */
-#define TEST_ITERATIONS 60000  /* 單輪測量次數 */
+/* Test parameter configurations */
+#define BIT_LENGTH 1024         /* Number of bits for testing */
+#define POOL_SIZE 1000          /* Size of the pool */
+#define TEST_ITERATIONS 60000  /* Number of measurements per round */
 
 BN_CTX *bn_ctx;
-BIGNUM *fixed_prime;               /* 用於 Mode 0 的固定質數 */
-BIGNUM *prime_pool[POOL_SIZE];     /* 質數池 (分母 m) */
-BIGNUM *composite_pool[POOL_SIZE]; /* 合數池 (分母 m) */
+BIGNUM *fixed_prime;               /* Fixed prime used for Mode 0 */
+BIGNUM *prime_pool[POOL_SIZE];     /* Prime pool (denominator m) */
+BIGNUM *composite_pool[POOL_SIZE]; /* Composite pool (denominator m) */
 BIGNUM **input_x_array;
 
-BIGNUM *fixed_base_a;              /* 固定的分子 x */
-BIGNUM *out_inv;                   /* 預先分配：接反元素的容器 */
-BIGNUM *out_gcd;                   /* 預先分配：接 GCD 的容器 */
-int top_w;                         /* 全域記憶體長度 */
+BIGNUM *fixed_base_a;              /* Fixed numerator x */
+BIGNUM *out_inv;                   /* Pre-allocated: container for the modular inverse */
+BIGNUM *out_gcd;                   /* Pre-allocated: container for the GCD */
+int top_w;                         /* Global memory length (number of limbs) */
 
-/* 全域變數：控制測試模式 */
-int eval_mode = 2; /* 0: fixed, 1: pool, 2: composite (預設) */
+/* Global variable: Controls the evaluation mode */
+int eval_mode = 2; /* 0: fixed, 1: pool, 2: composite (default) */
 
 /*
- * 🛠️ 支援三種模式的抽樣準備函數 (準備階段不計入執行時間)
+ * 🛠️ Sampling preparation function supporting three modes (Preparation phase is excluded from timing)
  */
 void prepare_inputs(dudect_config_t *c, uint8_t *input_data, uint8_t *classes) {
     randombytes(classes, c->number_measurements);
@@ -61,25 +61,25 @@ void prepare_inputs(dudect_config_t *c, uint8_t *input_data, uint8_t *classes) {
             }
         }
         
-        /* 🚨 極度重要：在進入計時區前，確保剛拷貝好的數字內部記憶體已撐開到 top_w */
+        /* 🚨 Extremely Important: Before entering the timed section, ensure the internal memory of the newly copied number is expanded to top_w */
         bn_wexpand(input_x_array[i], top_w);
     }
 }
 
 /*
- * ⏱️ 實際計時區塊：越乾淨越好，只能有演算法本身
+ * ⏱️ Actual timed section: Keep it as clean as possible, only the algorithm itself should be present
  */
 uint8_t do_one_computation(uint8_t *data) {
     size_t index = *(size_t *)data;
     
-    /* 🚨 呼叫最新的 Binary GCD/Inversion 實作 */
+    /* 🚨 Call the latest Constant-Time Binary GCD/Inversion implementation */
     ct_by_gcd_inv(out_inv, out_gcd, fixed_base_a, input_x_array[index], top_w, bn_ctx);
     
     return 0;
 }
 
 int main(int argc, char *argv[]) {
-    /* 解析命令列參數 */
+    /* Parse command-line arguments */
     if (argc == 2) {
         if (strcmp(argv[1], "fixed") == 0) eval_mode = 0;
         else if (strcmp(argv[1], "pool") == 0) eval_mode = 1;
@@ -103,14 +103,14 @@ int main(int argc, char *argv[]) {
     out_inv = BN_new();
     out_gcd = BN_new();
 
-    /* 計算我們目標位元數對應的 Limb 數量 (top_w) */
+    /* Calculate the number of limbs (top_w) corresponding to our target bit length */
     top_w = (BIT_LENGTH + BN_BITS2 - 1) / BN_BITS2;
     
-    /* 預先撐開輸出容器，避免在計時區內觸發 malloc */
+    /* Pre-expand the output containers to prevent triggering malloc within the timed section */
     bn_wexpand(out_inv, top_w);
     bn_wexpand(out_gcd, top_w);
 
-    /* 1. 初始化資料 */
+    /* 1. Initialize data */
     printf("--- Fair Test Preparation (GCD/Inversion: %s) ---\n", mode_str);
     
     printf("Generating Fixed Base 'x'...\n");
@@ -135,7 +135,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 2. Dudect 設定 */
+    /* 2. Dudect configuration */
     dudect_config_t conf = {
         .chunk_size = sizeof(size_t),
         .number_measurements = TEST_ITERATIONS
@@ -153,11 +153,11 @@ int main(int argc, char *argv[]) {
     printf("Mode: %s\n", mode_str);
 
     dudect_state_t state = DUDECT_NO_LEAKAGE_EVIDENCE_YET;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 30; i++) {
         dudect_main(&ctx);
     }
 
-    /* 3. 清理 */
+    /* 3. Cleanup */
     dudect_free(&ctx);
     for (size_t i = 0; i < conf.number_measurements; i++) BN_free(input_x_array[i]);
     for (int i = 0; i < POOL_SIZE; i++) {

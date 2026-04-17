@@ -8,21 +8,53 @@
 #define DUDECT_IMPLEMENTATION
 #include "dudect/src/dudect.h"
 
-/* --- 1. 完全對齊你提供的 OpenSSL 原始宣告 --- */
+/* --- Added: Small prime filtering logic --- */
+int small_primes[384];
+
+// Find the first 384 primes (the 384th prime is 2647)
+void generate_small_primes() {
+    int count = 0;
+    int num = 2;
+    while (count < 384) {
+        int is_p = 1;
+        for (int i = 2; i * i <= num; i++) {
+            if (num % i == 0) {
+                is_p = 0;
+                break;
+            }
+        }
+        if (is_p) {
+            small_primes[count++] = num;
+        }
+        num++;
+    }
+}
+
+// Check if the BIGNUM is divisible by these 384 small primes
+int is_too_easy_composite(const BIGNUM *bn) {
+    for (int i = 0; i < 384; i++) {
+        if (BN_mod_word(bn, small_primes[i]) == 0) {
+            return 1; // Divisible, too easy to filter out
+        }
+    }
+    return 0; // Passed the check
+}
+
+/* --- 1. Align perfectly with original OpenSSL declarations --- */
 extern int ossl_bn_miller_rabin_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx,
                                           BN_GENCB *cb, int enhanced, int *status);
 
-/* 其他演算法宣告 */
-extern int ossl_bn_lucas_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
+/* Other algorithm declarations */
+extern int ossl_bn_CHVL_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 extern int ossl_bn_solovay_strassen_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 extern int ossl_bn_miller_rabin_is_prime_unified(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
-extern int ossl_bn_ss_vset_hybrid_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
+extern int ossl_bn_CHVSS_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 
 #define BIT_LENGTH 1024         
 #define PRIME_POOL_SIZE 1000   
 #define TEST_ITERATIONS 20000  
 
-/* --- 檔案名稱定義 --- */
+/* --- File name definitions --- */
 #define FILE_FIXED  "dataset_fixed_prime.hex"
 #define FILE_PRIMES "dataset_prime_pool.hex"
 #define FILE_COMPS  "dataset_composite_pool.hex"
@@ -33,10 +65,10 @@ BIGNUM *prime_pool[PRIME_POOL_SIZE];
 BIGNUM *composite_pool[PRIME_POOL_SIZE]; 
 BIGNUM **input_x_array;
 
-int test_mode = 0; // 0: lucas, 1: mrunified, 2: hybrid, 3: ss, 4: mr (native)
+int test_mode = 0; // 0: CHVL, 1: mrunified, 2: CHVSS, 3: ss, 4: mr (native)
 int eval_type = 0; // 0: fixed, 1: pool, 2: composite
 
-/* --- 資料集存取函數 --- */
+/* --- Dataset access functions --- */
 int load_datasets() {
     FILE *f_fixed = fopen(FILE_FIXED, "r");
     FILE *f_primes = fopen(FILE_PRIMES, "r");
@@ -46,10 +78,10 @@ int load_datasets() {
         if (f_fixed) fclose(f_fixed);
         if (f_primes) fclose(f_primes);
         if (f_comps) fclose(f_comps);
-        return 0; // 檔案不齊全，需要重新生成
+        return 0; // Incomplete files, need to regenerate
     }
     
-    char buffer[2048]; // 足以容納 1024-bit 的 hex 字串與換行符
+    char buffer[2048]; // Large enough to hold a 1024-bit hex string and newline
     
     if (fgets(buffer, sizeof(buffer), f_fixed)) {
         BN_hex2bn(&fixed_prime, buffer);
@@ -94,7 +126,7 @@ void save_datasets() {
     fclose(f_comps);
 }
 
-/* --- Dudect 函數 --- */
+/* --- Dudect functions --- */
 void prepare_inputs(dudect_config_t *c, uint8_t *input_data, uint8_t *classes) {
     randombytes(classes, c->number_measurements);
     for (size_t i = 0; i < c->number_measurements; i++) {
@@ -117,9 +149,9 @@ uint8_t do_one_computation(uint8_t *data) {
     size_t index = *(size_t *)data;
     int status = 0;
     
-    if (test_mode == 0) ossl_bn_lucas_is_prime(input_x_array[index], 66, bn_ctx, NULL, &status);
+    if (test_mode == 0) ossl_bn_CHVL_is_prime(input_x_array[index], 66, bn_ctx, NULL, &status);
     else if (test_mode == 1) ossl_bn_miller_rabin_is_prime_unified(input_x_array[index], 64, bn_ctx, NULL, &status);
-    else if (test_mode == 2) ossl_bn_ss_vset_hybrid_is_prime(input_x_array[index], 69, bn_ctx, NULL, &status);
+    else if (test_mode == 2) ossl_bn_CHVSS_is_prime(input_x_array[index], 69, bn_ctx, NULL, &status);
     else if (test_mode == 3) ossl_bn_solovay_strassen_is_prime(input_x_array[index], 128, bn_ctx, NULL, &status);
     else if (test_mode == 4) ossl_bn_miller_rabin_is_prime(input_x_array[index], 64, bn_ctx, NULL, 0, &status);
 
@@ -128,13 +160,13 @@ uint8_t do_one_computation(uint8_t *data) {
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
-        printf("Usage: %s [lucas|mrunified|hybrid|ss|mr] [fixed|pool|composite]\n", argv[0]);
+        printf("Usage: %s [CHVL|mrunified|CHVSS|ss|mr] [fixed|pool|composite]\n", argv[0]);
         return 1;
     }
 
-    if (strcmp(argv[1], "lucas") == 0) test_mode = 0;
+    if (strcmp(argv[1], "CHVL") == 0) test_mode = 0;
     else if (strcmp(argv[1], "mrunified") == 0) test_mode = 1;
-    else if (strcmp(argv[1], "hybrid") == 0) test_mode = 2;
+    else if (strcmp(argv[1], "CHVSS") == 0) test_mode = 2;
     else if (strcmp(argv[1], "ss") == 0) test_mode = 3;
     else if (strcmp(argv[1], "mr") == 0) test_mode = 4;
 
@@ -147,19 +179,32 @@ int main(int argc, char *argv[]) {
 
     printf("--- YOUR Test Preparation (%d-bit) ---\n", BIT_LENGTH);
     
-    /* 核心修改：如果檔案存在就讀取，不存在就生成並存檔 */
+    /* Core modification: Read datasets if files exist, generate and save if they don't */
     if (!load_datasets()) {
-        printf("Datasets not found. Generating new pools and saving to files...\n");
+        printf("Datasets not found. Generating heavy-duty pools...\n");
+        generate_small_primes(); // Initialize the small primes table
+        
         BN_generate_prime_ex(fixed_prime, BIT_LENGTH, 0, NULL, NULL, NULL);
+        
         for (int i = 0; i < PRIME_POOL_SIZE; i++) {
             prime_pool[i] = BN_new();
             BN_generate_prime_ex(prime_pool[i], BIT_LENGTH, 0, NULL, NULL, NULL);
+            
             composite_pool[i] = BN_new();
-            do { BN_rand(composite_pool[i], BIT_LENGTH, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ODD);
-            } while (BN_check_prime(composite_pool[i], bn_ctx, NULL) == 1);
+            int attempts = 0;
+            do {
+                attempts++;
+                // Generate a random odd number
+                BN_rand(composite_pool[i], BIT_LENGTH, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ODD);
+                
+                // Condition: Must be composite and not divisible by the first 384 primes
+            } while (BN_check_prime(composite_pool[i], bn_ctx, NULL) == 1 || 
+                     is_too_easy_composite(composite_pool[i]));
+            
+            if (i % 100 == 0) printf("Generated %d heavy composites...\n", i);
         }
         save_datasets();
-        printf("Successfully generated and saved datasets!\n");
+        printf("Successfully generated heavy-duty datasets!\n");
     } else {
         printf("Successfully loaded identical datasets from hex files!\n");
     }
@@ -175,7 +220,7 @@ int main(int argc, char *argv[]) {
         dudect_main(&ctx);
     }
 
-    /* 記憶體釋放 */
+    /* Memory deallocation */
     dudect_free(&ctx);
     for (size_t i = 0; i < conf.number_measurements; i++) BN_free(input_x_array[i]);
     free(input_x_array);

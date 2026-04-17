@@ -329,1281 +329,6 @@ err:
     return ret;
 }
 
-/* --- 常數時間輔助函式 --- */
-
-/* 若 val >= 0 回傳 1，否則回傳 0 (針對 2's complement 有號數) */
-static inline int64_t ct_is_ge_zero(int64_t val) {
-    return (int64_t)(((uint64_t)val >> 63) ^ 1);
-}
-
-/* 判斷 uint64_t 是否非零：若 v > 0 回傳 1，若 v == 0 回傳 0 */
-static inline int64_t ct_is_nz_u64(uint64_t v) {
-    return (int64_t)((v | (~v + 1)) >> 63) & 1;
-}
-
-/* 若 bit 為 1 回傳全 1 遮罩 (0xFF...F)，若為 0 則回傳 0 */
-static inline int64_t ct_mask_64(int64_t bit) {
-    return -(bit & 1);
-}
-
-/* 常數時間選擇：根據遮罩選擇 a 或 b */
-static inline int64_t ct_select_64(int64_t mask, int64_t a, int64_t b) {
-    return (mask & a) | (~mask & b);
-}
-
-/* 算術右移 1 bit (Floor division) 的無分支實作 */
-static inline int64_t ct_asr_1(int64_t val) {
-    int64_t mask = ct_mask_64(val < 0);
-    return ct_select_64(mask, ~((~val) >> 1), val >> 1);
-}
-
-/* --- 固定長度大數 (CT_BIGNUM) 設定 --- */
-#define INPUT_LIMBS 32 
-#define WORK_LIMBS (INPUT_LIMBS + 2)
-
-static void ct_bn_cond_negate(uint64_t *x, int64_t mask) {
-    uint64_t carry = mask & 1;
-    for (int i = 0; i < WORK_LIMBS; i++) {
-        uint64_t inv = x[i] ^ mask;
-        x[i] = inv + carry;
-        carry = (x[i] < inv) ? 1 : 0;
-    }
-}
-
-static void ct_bn_from_openssl(uint64_t *out, const BIGNUM *in) {
-    unsigned char buf[INPUT_LIMBS * 8];
-    memset(buf, 0, sizeof(buf));
-    
-    BN_bn2lebinpad(in, buf, sizeof(buf)); 
-    
-    for (int i = 0; i < INPUT_LIMBS; i++) {
-        uint64_t limb = 0;
-        for(int j = 0; j < 8; j++) {
-            limb |= ((uint64_t)buf[i * 8 + j]) << (j * 8);
-        }
-        out[i] = limb;
-    }
-    for (int i = INPUT_LIMBS; i < WORK_LIMBS; i++) out[i] = 0;
-    
-    if (BN_is_negative(in)) {
-        ct_bn_cond_negate(out, -1);
-    }
-}
-
-static void ct_bn_add(uint64_t *res, const uint64_t *a, const uint64_t *b) {
-    uint64_t carry = 0;
-    for (int i = 0; i < WORK_LIMBS; i++) {
-        uint64_t sum1 = a[i] + b[i];
-        uint64_t c1 = (sum1 < a[i]) ? 1 : 0;
-        res[i] = sum1 + carry;
-        uint64_t c2 = (res[i] < sum1) ? 1 : 0;
-        carry = c1 | c2;
-    }
-}
-
-static void ct_bn_mul_signed(uint64_t *out, const uint64_t *in, int64_t multiplier) {
-    int64_t mask_neg = ct_mask_64(multiplier < 0);
-    uint64_t abs_m = (uint64_t)ct_select_64(mask_neg, -multiplier, multiplier);
-    
-    uint64_t temp[WORK_LIMBS];
-    for (int i = 0; i < WORK_LIMBS; i++) temp[i] = in[i];
-    
-    ct_bn_cond_negate(temp, mask_neg);
-    
-    uint64_t carry = 0;
-    for (int i = 0; i < WORK_LIMBS; i++) {
-        unsigned __int128 p = (unsigned __int128)temp[i] * abs_m + carry;
-        out[i] = (uint64_t)p;
-        carry = (uint64_t)(p >> 64);
-    }
-}
-
-static void ct_bn_rshift(uint64_t *x, int shift) {
-    if (shift == 0) return;
-    uint64_t sign_ext = ((int64_t)x[WORK_LIMBS - 1] < 0) ? (~0ULL << (64 - shift)) : 0;
-    
-    for (int i = 0; i < WORK_LIMBS - 1; i++) {
-        x[i] = (x[i] >> shift) | (x[i + 1] << (64 - shift));
-    }
-    x[WORK_LIMBS - 1] = (x[WORK_LIMBS - 1] >> shift) | sign_ext;
-}
-
-static void batch_matrix(int64_t *x_io, int64_t *y_io, int64_t *delta_io, int batch,
-                         int64_t *a_out, int64_t *b_out, int64_t *c_out, int64_t *d_out, 
-                         uint64_t *u_acc) {
-    int64_t a = 1, b = 0, c = 0, d = 1;
-    int64_t x = *x_io, y = *y_io, delta = *delta_io;
-    uint64_t u = 0;
-    
-    for (int i = 0; i < batch; i++) {
-        int64_t yi = y;
-        int64_t mask_swap = ct_mask_64(ct_is_ge_zero(delta) & (x & 1));
-        int64_t mask_odd  = ct_mask_64(x & 1);
-
-        delta = ct_select_64(mask_swap, -delta, 1 + delta);
-
-        int64_t operand_y = ct_select_64(mask_swap, -y, ct_select_64(mask_odd, y, 0));
-        int64_t next_y    = ct_select_64(mask_swap, x, y);
-        x = ct_asr_1(x + operand_y);
-        y = next_y;
-
-        int64_t next_a = ct_select_64(mask_swap, a - c, ct_select_64(mask_odd, a + c, a));
-        int64_t next_b = ct_select_64(mask_swap, b - d, ct_select_64(mask_odd, b + d, b));
-        int64_t next_ci = ct_select_64(mask_swap, 2 * a, 2 * c);
-        int64_t next_di = ct_select_64(mask_swap, 2 * b, 2 * d);
-
-        a = next_a; b = next_b; c = next_ci; d = next_di;
-
-        uint64_t u_y = (uint64_t)y;
-        u += (((uint64_t)yi & u_y) ^ (uint64_t)ct_asr_1((int64_t)u_y)) & 2;
-        u += (u & 1) ^ (c < 0 ? 1 : 0);
-        u %= 4;
-    }
-    
-    *x_io = x; *y_io = y; *delta_io = delta;
-    *a_out = a; *b_out = b; *c_out = c; *d_out = d;
-    *u_acc = u;
-}
-
-/* --- 主函式 --- */
-int ossl_bn_jacobi_by(const BIGNUM *x_in, const BIGNUM *y_in, BN_CTX *ctx) {
-    uint64_t ct_x[WORK_LIMBS], ct_y[WORK_LIMBS];
-    
-    ct_bn_from_openssl(ct_x, x_in);
-    ct_bn_from_openssl(ct_y, y_in);
-
-    uint64_t y_zero_acc = 0;
-    for (int i = 0; i < WORK_LIMBS; i++) y_zero_acc |= ct_y[i];
-    int64_t mask_initial_y_zero = ct_mask_64(ct_is_nz_u64(y_zero_acc) ^ 1);
-    int64_t mask_initial_y_even = ct_mask_64((ct_y[0] & 1) ^ 1);
-
-    int x_neg = BN_is_negative(x_in);
-    int y_neg = BN_is_negative(y_in);
-    
-    /* 為了配合 Safegcd 以及 Kronecker symbol，將 x, y 強制轉正並補償符號 */
-    if (x_neg) ct_bn_cond_negate(ct_x, -1);
-    if (y_neg) ct_bn_cond_negate(ct_y, -1);
-
-    /* 轉正後，直接取最低位元即可獲得正確的 |y| % 4 */
-    uint64_t abs_y_mod_4 = ct_y[0] & 3; 
-    
-    int sign_multiplier = 1;
-    if (x_neg && y_neg) sign_multiplier = -1;
-    if (x_neg && abs_y_mod_4 == 3) sign_multiplier = -sign_multiplier;
-
-    /* 確保跑滿足夠的迭代次數 (2048-bit 上限) */
-    int max_bits = INPUT_LIMBS * 64; 
-    int niters = (45907 * max_bits + 26313) / 19929;
-    
-    int64_t delta = 0; 
-    uint64_t t = 0; 
-    int batch = 60; 
-    int num_loops = (niters + batch - 1) / batch + 2; 
-    uint64_t mask = (1ULL << (batch + 2)) - 1; 
-
-    for (int i = 0; i < num_loops; i++) {
-        int64_t x_prime = (int64_t)(ct_x[0] & mask);
-        int64_t y_prime = (int64_t)(ct_y[0] & mask);
-        
-        int64_t a_i, b_i, c_i, d_i;
-        uint64_t u_acc = 0;
-
-        batch_matrix(&x_prime, &y_prime, &delta, batch, &a_i, &b_i, &c_i, &d_i, &u_acc);
-
-        uint64_t tx_a[WORK_LIMBS], ty_b[WORK_LIMBS];
-        uint64_t tx_c[WORK_LIMBS], ty_d[WORK_LIMBS];
-
-        ct_bn_mul_signed(tx_a, ct_x, a_i);
-        ct_bn_mul_signed(ty_b, ct_y, b_i);
-        ct_bn_add(tx_a, tx_a, ty_b);  
-
-        ct_bn_mul_signed(tx_c, ct_x, c_i);
-        ct_bn_mul_signed(ty_d, ct_y, d_i);
-        ct_bn_add(tx_c, tx_c, ty_d);  
-
-        ct_bn_rshift(tx_a, batch);
-        ct_bn_rshift(tx_c, batch);
-        
-        for (int j = 0; j < WORK_LIMBS; j++) {
-            ct_x[j] = tx_a[j];
-            ct_y[j] = tx_c[j];
-        }
-        
-        t = (t + u_acc) % 4;
-        int y_sign = ((int64_t)ct_y[WORK_LIMBS - 1] < 0) ? 1 : 0;
-        t = (t + ((t & 1) ^ y_sign)) % 4;
-    }
-
-    t = (t + (t & 1)) % 4;
-    
-    /* 🚀 關鍵修正：Safegcd 可能終止於 y = +1 或是 y = -1，我們必須取絕對值來判斷 GCD 是否為 1 */
-    uint64_t final_y_abs[WORK_LIMBS];
-    for (int i = 0; i < WORK_LIMBS; i++) final_y_abs[i] = ct_y[i];
-    int64_t final_y_neg = ct_mask_64(((int64_t)ct_y[WORK_LIMBS - 1] < 0) ? 1 : 0);
-    ct_bn_cond_negate(final_y_abs, final_y_neg); /* 將結果取絕對值 */
-
-    uint64_t y_high_or = 0;
-    for (int i = 1; i < WORK_LIMBS; i++) y_high_or |= final_y_abs[i];
-    
-    int64_t mask_y_high_zero = ct_mask_64(ct_is_nz_u64(y_high_or) ^ 1);
-    int64_t mask_y_d0_one = ct_mask_64((final_y_abs[0] == 1) ? 1 : 0);
-    int64_t mask_is_gcd_one = mask_y_high_zero & mask_y_d0_one; 
-    
-    int64_t mask_error = mask_initial_y_zero | mask_initial_y_even;
-    int expected_jacobi = 1 - (int)t;
-    int final_ret = (int)ct_select_64(mask_is_gcd_one, (int64_t)(sign_multiplier * expected_jacobi), 0);
-
-    return (int)ct_select_64(mask_error, 0, final_ret);
-}
-
-/* ====================================================================
- * 內部硬體級常數時間輔助函式 (Hardware-level CT Helpers)
- * ==================================================================== */
-
-/* ====================================================================
- * 內部硬體級常數時間輔助函式 (Hardware-level CT Helpers)
- * ==================================================================== */
-
-/* ====================================================================
- * 內部硬體級常數時間輔助函式 (Hardware-level CT Helpers)
- * ==================================================================== */
-
-static void ct_pad_top(BIGNUM *a, int target_top) {
-    int curr = a->top;
-    for (int i = 0; i < target_top; i++) {
-        BN_ULONG mask = (BN_ULONG)0 - (BN_ULONG)(i < curr);
-        a->d[i] &= mask;
-    }
-    a->top = target_top; 
-}
-
-static int ct_bn_is_zero(const BIGNUM *a, int target_top) {
-    BN_ULONG acc = 0;
-    for (int k = 0; k < target_top; k++) {
-        acc |= a->d[k];
-    }
-    return (acc == 0);
-}
-
-static void ct_swap_arrays(int swap, BIGNUM *A, BIGNUM *B, int top_w) {
-    BN_ULONG mask = 0 - (BN_ULONG)swap;
-    for (int i = 0; i < top_w; i++) {
-        BN_ULONG tmp = (A->d[i] ^ B->d[i]) & mask;
-        A->d[i] ^= tmp;
-        B->d[i] ^= tmp;
-    }
-}
-
-static void ct_mod_add(BIGNUM *r, const BIGNUM *a, const BIGNUM *b, const BIGNUM *m, int top_w, BIGNUM *tmp) {
-    BN_ULONG carry = bn_add_words(r->d, a->d, b->d, top_w);
-    r->top = top_w; r->neg = 0;
-    BN_ULONG borrow = bn_sub_words(tmp->d, r->d, m->d, top_w);
-    tmp->top = top_w; tmp->neg = 0;
-    ct_swap_arrays(carry | (1 - borrow), r, tmp, top_w);
-}
-
-static void ct_mod_sub(BIGNUM *r, const BIGNUM *a, const BIGNUM *b, const BIGNUM *m, int top_w, BIGNUM *tmp) {
-    BN_ULONG borrow = bn_sub_words(r->d, a->d, b->d, top_w);
-    r->top = top_w; r->neg = 0;
-    (void)bn_add_words(tmp->d, r->d, m->d, top_w);
-    tmp->top = top_w; tmp->neg = 0;
-    ct_swap_arrays(borrow, r, tmp, top_w);
-}
-
-/* 🔥 內部運算用拷貝：無視 top，強制拷貝陣列 (拯救被誤殺的乘法) */
-static void ct_bn_copy(BIGNUM *dst, const BIGNUM *src, int top_w) {
-    for (int i = 0; i < top_w; i++) dst->d[i] = src->d[i];
-    dst->top = top_w; dst->neg = 0;
-}
-
-/* 🔥 外部防禦用拷貝：高位元若無資料則強制補零，防禦記憶體垃圾 */
-static void ct_bn_copy_padded(BIGNUM *dst, const BIGNUM *src, int top_w) {
-    for (int i = 0; i < top_w; i++) {
-        dst->d[i] = (i < src->top) ? src->d[i] : 0;
-    }
-    dst->top = top_w; dst->neg = 0;
-}
-
-static void ct_bn_rshift1(BIGNUM *a, int top_w) {
-    BN_ULONG carry = 0;
-    for (int i = top_w - 1; i >= 0; i--) {
-        BN_ULONG next_carry = (a->d[i] & 1) << (BN_BITS2 - 1);
-        a->d[i] = (a->d[i] >> 1) | carry;
-        carry = next_carry;
-    }
-    a->top = top_w;
-}
-
-static void ct_bn_add_word(BIGNUM *a, BN_ULONG w, int top_w) {
-    BN_ULONG c = w;
-    for (int i = 0; i < top_w; i++) {
-        BN_ULONG sum = a->d[i] + c;
-        c = (sum < a->d[i]) ? 1 : 0;
-        a->d[i] = sum;
-    }
-    a->top = top_w;
-}
-
-/* 乘法結果使用 ct_bn_copy (強制拷貝陣列)，完美保護資料 */
-static void ct_mont_mul(BIGNUM *r, const BIGNUM *a, const BIGNUM *b, const BN_MONT_CTX *mont, int top_w, BIGNUM *tmp) {
-    bn_mul_mont(tmp->d, a->d, b->d, mont->N.d, mont->n0, top_w);
-    ct_bn_copy(r, tmp, top_w);
-}
-
-/* ====================================================================
- * 同時支援求 GCD 與反元素的 Constant-Time 演算法
- * ==================================================================== */
-void ct_by_gcd_inv(BIGNUM *out_inv, BIGNUM *out_gcd, const BIGNUM *x, const BIGNUM *m, int top_w, BN_CTX *ctx) {
-    BN_CTX_start(ctx);
-    BIGNUM *A = BN_CTX_get(ctx); bn_wexpand(A, top_w); ct_pad_top(A, top_w);
-    BIGNUM *B = BN_CTX_get(ctx); bn_wexpand(B, top_w); ct_pad_top(B, top_w);
-    BIGNUM *U = BN_CTX_get(ctx); bn_wexpand(U, top_w); ct_pad_top(U, top_w);
-    BIGNUM *V = BN_CTX_get(ctx); bn_wexpand(V, top_w); ct_pad_top(V, top_w);
-    BIGNUM *tmp1 = BN_CTX_get(ctx); bn_wexpand(tmp1, top_w); ct_pad_top(tmp1, top_w);
-    BIGNUM *tmp2 = BN_CTX_get(ctx); bn_wexpand(tmp2, top_w); ct_pad_top(tmp2, top_w);
-    
-    /* 吃入外部變數，使用 PADDED 安全拷貝防禦垃圾記憶體！ */
-    ct_bn_copy_padded(A, m, top_w);
-    ct_bn_copy_padded(B, x, top_w);
-    BN_zero(U); ct_pad_top(U, top_w);
-    BN_one(V); ct_pad_top(V, top_w);
-    
-    int iters = 3 * top_w * BN_BITS2;
-    
-    for (int i = 0; i < iters; i++) {
-        int B_is_odd = B->d[0] & 1;
-        
-        BN_ULONG borrow = bn_sub_words(tmp1->d, A->d, B->d, top_w);
-        int swap = B_is_odd & (1 - (int)borrow);
-        
-        ct_swap_arrays(swap, A, B, top_w);
-        ct_swap_arrays(swap, U, V, top_w);
-        
-        bn_sub_words(tmp1->d, B->d, A->d, top_w);
-        ct_swap_arrays(B_is_odd, B, tmp1, top_w);
-        
-        ct_mod_sub(tmp2, V, U, m, top_w, tmp1);
-        ct_swap_arrays(B_is_odd, V, tmp2, top_w);
-        
-        ct_bn_rshift1(B, top_w);
-        
-        int V_is_odd = V->d[0] & 1;
-        BN_ULONG carry = bn_add_words(tmp1->d, V->d, m->d, top_w);
-        for (int j = 0; j < top_w - 1; j++) {
-            tmp1->d[j] = (tmp1->d[j] >> 1) | ((tmp1->d[j+1] & 1) << (BN_BITS2 - 1));
-        }
-        tmp1->d[top_w - 1] = (tmp1->d[top_w - 1] >> 1) | (carry << (BN_BITS2 - 1));
-        tmp1->top = top_w; tmp1->neg = 0;
-        
-        ct_bn_rshift1(V, top_w);
-        ct_swap_arrays(V_is_odd, V, tmp1, top_w);
-    }
-    
-    /* 輸出時內部變數一定是乾淨的，使用原本拷貝即可 */
-    if (out_inv) ct_bn_copy(out_inv, U, top_w);
-    if (out_gcd) ct_bn_copy(out_gcd, A, top_w);
-    BN_CTX_end(ctx);
-}
-
-/* 這是給 Lucas Test 專用的 Wrapper (只拿反元素) */
-void ct_by_invert(BIGNUM *out, const BIGNUM *x, const BIGNUM *m, int top_w, BN_CTX *ctx) {
-    ct_by_gcd_inv(out, NULL, x, m, top_w, ctx);
-}
-
-/* ====================================================================
- * 原本的 bn_mod_exp_mont_ladder (供 Miller-Rabin 等測試使用)
- * ==================================================================== */
-static int bn_mod_exp_mont_ladder(BIGNUM *r, const BIGNUM *a, const BIGNUM *p,
-                                  const BIGNUM *m, BN_CTX *ctx, BN_MONT_CTX *mont) {
-    BIGNUM *R0, *R1, *t1;
-    int i, bit;
-    int top_m = m->top;
-    
-    BN_CTX_start(ctx);
-    R0 = BN_CTX_get(ctx);
-    R1 = BN_CTX_get(ctx);
-    t1 = BN_CTX_get(ctx);
-    
-    BN_one(R0);
-    BN_to_montgomery(R0, R0, mont, ctx);
-    BN_to_montgomery(R1, a, mont, ctx);
-    
-    bn_wexpand(R0, top_m); ct_pad_top(R0, top_m);
-    bn_wexpand(R1, top_m); ct_pad_top(R1, top_m);
-    bn_wexpand(t1, top_m); ct_pad_top(t1, top_m);
-    
-    for (i = BN_num_bits(p) - 1; i >= 0; i--) {
-        bit = BN_is_bit_set(p, i);
-        
-        ct_pad_top(R0, top_m); ct_pad_top(R1, top_m);
-        ct_swap_arrays(bit, R0, R1, top_m);
-        
-        BN_mod_mul_montgomery(t1, R0, R1, mont, ctx); 
-        BN_mod_mul_montgomery(R0, R0, R0, mont, ctx); 
-        BN_copy(R1, t1);                              
-        
-        ct_pad_top(R0, top_m); ct_pad_top(R1, top_m);
-        ct_swap_arrays(bit, R0, R1, top_m);
-    }
-    
-    BN_from_montgomery(r, R0, mont, ctx);
-    BN_CTX_end(ctx);
-    return 1;
-}
-
-/*
- * CCS 2026 Submission: Amortized Hybrid SS-Vset Engine
- * - 8 Random bases (Jacobi + SS Test)
- * - 17 Small prime bases (Jacobi only, as Fallback for D)
- * - (iterations - 8) rounds of Vset Trace Test
- */
-/* ====================================================================
- * 全新撰寫：100% Constant-Time Montgomery 模冪運算 (供 SS Test 使用)
- * ==================================================================== */
-static int ct_mod_exp_mont_ladder(BIGNUM *r, const BIGNUM *a, const BIGNUM *p, 
-                                  const BN_MONT_CTX *mont, int top_w, BN_CTX *ctx, 
-                                  BIGNUM *plain_one, BIGNUM *ct_tmp) {
-    BN_CTX_start(ctx);
-    BIGNUM *R0 = BN_CTX_get(ctx); bn_wexpand(R0, top_w); ct_pad_top(R0, top_w);
-    BIGNUM *R1 = BN_CTX_get(ctx); bn_wexpand(R1, top_w); ct_pad_top(R1, top_w);
-    
-    ct_mont_mul(R0, plain_one, &(mont->RR), mont, top_w, ct_tmp);
-    ct_mont_mul(R1, a, &(mont->RR), mont, top_w, ct_tmp);
-    
-    /* 注意：迴圈次數取決於位元長度，但因為 p 是公開的 w_minus_1，所以長度洩漏是安全的 */
-    int p_bits = BN_num_bits(p); 
-    for (int i = p_bits - 1; i >= 0; i--) {
-        int word_idx = i / BN_BITS2;
-        int bit_idx = i % BN_BITS2;
-        int bit = (int)((p->d[word_idx] >> bit_idx) & 1);
-        
-        ct_swap_arrays(bit, R0, R1, top_w);
-        
-        ct_mont_mul(R1, R0, R1, mont, top_w, ct_tmp); 
-        ct_mont_mul(R0, R0, R0, mont, top_w, ct_tmp); 
-        
-        ct_swap_arrays(bit, R0, R1, top_w);
-    }
-    
-    ct_mont_mul(r, R0, plain_one, mont, top_w, ct_tmp);
-    BN_CTX_end(ctx);
-    return 1;
-}
-
-/* ====================================================================
- * 神級技巧：Constant-Time Montgomery Batch Inversion (動態 Batch 大小)
- * 輸入 X[0...n-1] (Normal Form)，輸出 X_inv[0...n-1] (Normal Form)
- * ==================================================================== */
-static int ct_batch_invert_mont(BIGNUM **X_inv, BIGNUM **X, int n, const BIGNUM *w, 
-                                int top_w, BN_CTX *ctx, BN_MONT_CTX *mont, 
-                                BIGNUM *plain_one, BIGNUM *ct_tmp, int *is_composite) 
-{
-    if (n <= 0) return 1;
-    int ret = 0;
-    BN_CTX_start(ctx);
-    
-    BIGNUM *I_all = BN_CTX_get(ctx);
-    BIGNUM *X_mont = BN_CTX_get(ctx);
-    BIGNUM **C = OPENSSL_malloc(n * sizeof(BIGNUM *)); /* 動態配置 */
-    
-    if (C == NULL || I_all == NULL || X_mont == NULL) goto end;
-    
-    bn_wexpand(I_all, top_w); ct_pad_top(I_all, top_w);
-    bn_wexpand(X_mont, top_w); ct_pad_top(X_mont, top_w);
-
-    for (int i = 0; i < n; i++) {
-        C[i] = BN_CTX_get(ctx);
-        if (C[i] == NULL) goto end;
-        bn_wexpand(C[i], top_w); ct_pad_top(C[i], top_w);
-        
-        /* ⚠️ CT 防禦：若 X[i] 為 0，強制設為 1 並標記合數，防止求逆爆炸 */
-        int is_zero = ct_bn_is_zero(X[i], top_w);
-        *is_composite |= is_zero;
-        ct_swap_arrays(is_zero, X[i], plain_one, top_w);
-    }
-
-    /* 1. 累積連乘積 (轉換為 Mont Form 累積) */
-    ct_mont_mul(C[0], X[0], &(mont->RR), mont, top_w, ct_tmp); 
-    for (int i = 1; i < n; i++) {
-        ct_mont_mul(X_mont, X[i], &(mont->RR), mont, top_w, ct_tmp);
-        ct_mont_mul(C[i], C[i-1], X_mont, mont, top_w, ct_tmp); 
-    }
-
-    /* 2. 唯一的一次二元 GCD 求反元素 */
-    ct_by_invert(I_all, C[n-1], w, top_w, ctx);
-
-    /* 3. 反向推導所有反元素 */
-    for (int i = n - 1; i > 0; i--) {
-        ct_mont_mul(X_inv[i], I_all, C[i-1], mont, top_w, ct_tmp);
-        ct_mont_mul(X_inv[i], X_inv[i], &(mont->RR), mont, top_w, ct_tmp); 
-        
-        ct_mont_mul(X_mont, X[i], &(mont->RR), mont, top_w, ct_tmp);
-        ct_mont_mul(I_all, I_all, X_mont, mont, top_w, ct_tmp);
-    }
-    ct_mont_mul(X_inv[0], I_all, &(mont->RR), mont, top_w, ct_tmp); 
-
-    ret = 1;
-end:
-    if (C != NULL) OPENSSL_free(C); /* 安全釋放 */
-    BN_CTX_end(ctx);
-    return ret;
-}
-
-
-/* ====================================================================
- * 主程式：完美的極速常數時間 Lucas 質數測試 (100% CT Fixed)
- * ==================================================================== */
-/* ====================================================================
- * 主程式：完美的極速常數時間 Lucas 質數測試 (100% CT + Batch Inversion)
- * ==================================================================== */
-int ossl_bn_lucas_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx,
-                           BN_GENCB *cb, int *status)
-{
-    int i, j, bit, bit_len, ret = 0;
-    BIGNUM *w1, *e, *D, *D_mont, *P, *mont_one, *mont_two, *w_minus_two, *c_mont;
-    BIGNUM *R0_A, *R0_B, *R1_A, *R1_B;
-    BIGNUM *m1, *m2, *m3, *tB1D, *temp_A, *temp_B, *tmp_prime, *ct_tmp, *plain_one, *plain_two;
-    BN_MONT_CTX *mont = NULL;
-    
-    if (!BN_is_odd(w)) return 0;
-
-    BN_CTX_start(ctx);
-    
-    w1 = BN_CTX_get(ctx); e = BN_CTX_get(ctx); 
-    D = BN_CTX_get(ctx); D_mont = BN_CTX_get(ctx);
-    P = BN_CTX_get(ctx); 
-    mont_one = BN_CTX_get(ctx); mont_two = BN_CTX_get(ctx);
-    w_minus_two = BN_CTX_get(ctx); c_mont = BN_CTX_get(ctx);
-    R0_A = BN_CTX_get(ctx); R0_B = BN_CTX_get(ctx);
-    R1_A = BN_CTX_get(ctx); R1_B = BN_CTX_get(ctx);
-    m1 = BN_CTX_get(ctx); m2 = BN_CTX_get(ctx); m3 = BN_CTX_get(ctx); 
-    tB1D = BN_CTX_get(ctx); temp_A = BN_CTX_get(ctx); temp_B = BN_CTX_get(ctx);
-    tmp_prime = BN_CTX_get(ctx); ct_tmp = BN_CTX_get(ctx); 
-    plain_one = BN_CTX_get(ctx); plain_two = BN_CTX_get(ctx);
-
-    if (plain_two == NULL) goto err;
-
-    if (!BN_copy(w1, w)) goto err;
-    BN_set_flags(w1, BN_FLG_CONSTTIME);
-
-    int top_w = w1->top;
-
-    BIGNUM *all_vars[] = {w1, e, D, D_mont, P, mont_one, mont_two, w_minus_two, c_mont,
-                          R0_A, R0_B, R1_A, R1_B, m1, m2, m3, tB1D, temp_A, temp_B, tmp_prime, ct_tmp, plain_one, plain_two};
-    for (int k = 0; k < 23; k++) {
-        if (!bn_wexpand(all_vars[k], top_w)) goto err;
-        ct_pad_top(all_vars[k], top_w);
-    }
-
-    int found_mask = 0;
-    BN_zero(D); ct_pad_top(D, top_w);
-
-    int is_3_mod_4 = BN_is_bit_set(w, 1); 
-    int target_j_val = is_3_mod_4 ? 1 : -1;
-
-    static const int small_primes[] = {
-        3, 5, 7, 11, 13, 17, 19, 23, 29, 31,
-        37, 41, 43, 47, 53, 59, 61, 67, 71, 73,
-        79, 83, 89, 97, 101
-    };
-    
-    for (int k = 0; k < 25; k++) {
-        BN_set_word(tmp_prime, small_primes[k]);
-        ct_pad_top(tmp_prime, top_w);
-
-        int j_val = ossl_bn_jacobi_by(tmp_prime, w, ctx); 
-        
-        int is_match = (j_val == target_j_val);
-        int update = is_match & (!found_mask);
-        
-        ct_swap_arrays(update, D, tmp_prime, top_w);
-        found_mask |= update;
-    }
-
-    int is_composite = (1 - found_mask);
-
-    ct_bn_copy_padded(e, w1, top_w);
-    ct_bn_rshift1(e, top_w);
-    ct_bn_add_word(e, 1 - (int)is_3_mod_4, top_w);
-    
-    bit_len = BN_num_bits(w1) - 1; 
-
-    mont = BN_MONT_CTX_new();
-    if (mont == NULL || !BN_MONT_CTX_set(mont, w1, ctx)) goto err;
-    
-    BN_one(plain_one); ct_pad_top(plain_one, top_w);
-    BN_set_word(plain_two, 2); ct_pad_top(plain_two, top_w);
-
-    ct_mont_mul(D_mont, D, &(mont->RR), mont, top_w, ct_tmp);
-    ct_mont_mul(mont_one, plain_one, &(mont->RR), mont, top_w, ct_tmp);
-    ct_mont_mul(mont_two, plain_two, &(mont->RR), mont, top_w, ct_tmp);
-    
-    ct_mod_sub(w_minus_two, w1, plain_two, w1, top_w, ct_tmp);
-
-    int w_bits_minus_1 = BN_num_bits(w1) - 1;
-    const int NUM_STRONG_TESTS = 6;
-    int strong_iters = (iterations < NUM_STRONG_TESTS) ? iterations : NUM_STRONG_TESTS;
-
-    for (i = 0; i < strong_iters; ++i) {
-        if (!BN_priv_rand_ex(P, w_bits_minus_1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, 0, ctx)) goto err;
-        ct_pad_top(P, top_w); 
-        ct_bn_add_word(P, 1, top_w);
-
-        ct_mont_mul(R1_A, P, &(mont->RR), mont, top_w, ct_tmp); 
-        ct_bn_copy(R1_B, mont_one, top_w);
-        ct_bn_copy(R0_A, mont_one, top_w);
-        ct_mod_sub(R0_B, mont_one, mont_one, w1, top_w, ct_tmp); 
-
-        for (j = bit_len - 1; j >= 0; --j) {
-            int word_idx = j / BN_BITS2;
-            int bit_idx = j % BN_BITS2;
-            bit = (int)((e->d[word_idx] >> bit_idx) & 1);
-
-            ct_swap_arrays(bit, R0_A, R1_A, top_w);
-            ct_swap_arrays(bit, R0_B, R1_B, top_w);
-
-            ct_mod_add(m1, R0_A, R0_B, w1, top_w, ct_tmp);
-            ct_mod_add(m2, R1_A, R1_B, w1, top_w, ct_tmp);
-            
-            ct_mont_mul(m3, m1, m2, mont, top_w, ct_tmp); 
-            ct_mont_mul(m1, R0_A, R1_A, mont, top_w, ct_tmp); 
-            ct_mont_mul(m2, R0_B, R1_B, mont, top_w, ct_tmp); 
-            ct_mont_mul(tB1D, m2, D_mont, mont, top_w, ct_tmp); 
-            
-            ct_mod_add(R1_A, m1, tB1D, w1, top_w, ct_tmp);
-            ct_mod_sub(R1_B, m3, m1, w1, top_w, ct_tmp);
-            ct_mod_sub(R1_B, R1_B, m2, w1, top_w, ct_tmp);
-
-            ct_mont_mul(m3, R0_A, R0_B, mont, top_w, ct_tmp); 
-            ct_mont_mul(m1, R0_A, R0_A, mont, top_w, ct_tmp); 
-            ct_mont_mul(m2, R0_B, R0_B, mont, top_w, ct_tmp); 
-            ct_mont_mul(tB1D, m2, D_mont, mont, top_w, ct_tmp); 
-            
-            ct_mod_add(R0_A, m1, tB1D, w1, top_w, ct_tmp);
-            ct_mod_add(R0_B, m3, m3, w1, top_w, ct_tmp);
-
-            ct_swap_arrays(bit, R0_A, R1_A, top_w);
-            ct_swap_arrays(bit, R0_B, R1_B, top_w);
-        }
-
-        ct_mont_mul(temp_A, R0_A, plain_one, mont, top_w, ct_tmp); 
-        ct_mont_mul(temp_B, R0_B, plain_one, mont, top_w, ct_tmp); 
-
-        int pass_this_round = ct_bn_is_zero(temp_A, top_w) | ct_bn_is_zero(temp_B, top_w);
-        is_composite |= (1 - pass_this_round);
-    }
-
-    int vset_iters = iterations - strong_iters;
-    if (vset_iters > 0) {
-        BIGNUM **batch_P = OPENSSL_malloc(vset_iters * sizeof(BIGNUM *));
-        BIGNUM **batch_m3 = OPENSSL_malloc(vset_iters * sizeof(BIGNUM *));
-        BIGNUM **batch_inv = OPENSSL_malloc(vset_iters * sizeof(BIGNUM *));
-
-        if (batch_P == NULL || batch_m3 == NULL || batch_inv == NULL) {
-            if (batch_P) OPENSSL_free(batch_P);
-            if (batch_m3) OPENSSL_free(batch_m3);
-            if (batch_inv) OPENSSL_free(batch_inv);
-            goto err;
-        }
-
-        for (int k = 0; k < vset_iters; k++) {
-            batch_P[k] = BN_CTX_get(ctx);
-            batch_m3[k] = BN_CTX_get(ctx);
-            batch_inv[k] = BN_CTX_get(ctx);
-            if (batch_P[k] == NULL || batch_m3[k] == NULL || batch_inv[k] == NULL) goto err;
-            bn_wexpand(batch_P[k], top_w); ct_pad_top(batch_P[k], top_w);
-            bn_wexpand(batch_m3[k], top_w); ct_pad_top(batch_m3[k], top_w);
-            bn_wexpand(batch_inv[k], top_w); ct_pad_top(batch_inv[k], top_w);
-        }
-
-        /* Phase 1: 預先計算所有的 P 與 m3 (P^3 - D) */
-        for (int k = 0; k < vset_iters; k++) {
-            if (!BN_priv_rand_ex(batch_P[k], w_bits_minus_1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, 0, ctx)) goto err;
-            ct_pad_top(batch_P[k], top_w); 
-            ct_bn_add_word(batch_P[k], 1, top_w); 
-
-            ct_mont_mul(m1, batch_P[k], &(mont->RR), mont, top_w, ct_tmp);
-            ct_mont_mul(m1, m1, m1, mont, top_w, ct_tmp); 
-            ct_mont_mul(m1, m1, plain_one, mont, top_w, ct_tmp); 
-
-            ct_mod_sub(batch_m3[k], m1, D, w1, top_w, ct_tmp);          
-        }
-
-        /* Phase 2: 100% CT Montgomery Batch Inversion！(N 個數字只呼叫 1 次 ct_by_invert) */
-        if (!ct_batch_invert_mont(batch_inv, batch_m3, vset_iters, w1, top_w, ctx, mont, plain_one, ct_tmp, &is_composite)) {
-            goto err;
-        }
-
-        /* Phase 3: 執行 Trace Ladder */
-        for (int k = 0; k < vset_iters; k++) {
-            /* 重算 m2 = P^3 + D */
-            ct_mont_mul(m1, batch_P[k], &(mont->RR), mont, top_w, ct_tmp);
-            ct_mont_mul(m1, m1, m1, mont, top_w, ct_tmp); 
-            ct_mont_mul(m1, m1, plain_one, mont, top_w, ct_tmp); 
-            ct_mod_add(m2, m1, D, w1, top_w, ct_tmp);
-
-            ct_bn_copy(temp_A, batch_inv[k], top_w);
-            
-            ct_mont_mul(m2, m2, &(mont->RR), mont, top_w, ct_tmp);
-            ct_mont_mul(temp_A, temp_A, &(mont->RR), mont, top_w, ct_tmp);
-            ct_mont_mul(temp_B, m2, temp_A, mont, top_w, ct_tmp);
-            ct_mont_mul(temp_B, temp_B, plain_one, mont, top_w, ct_tmp);
-            
-            ct_mod_add(temp_B, temp_B, temp_B, w1, top_w, ct_tmp); 
-
-            ct_mont_mul(c_mont, temp_B, &(mont->RR), mont, top_w, ct_tmp); 
-            ct_bn_copy(R1_A, c_mont, top_w);
-            ct_bn_copy(R0_A, mont_two, top_w);                     
-
-            for (j = bit_len - 1; j >= 0; --j) {
-                int word_idx = j / BN_BITS2;
-                int bit_idx = j % BN_BITS2;
-                bit = (int)((e->d[word_idx] >> bit_idx) & 1);
-
-                ct_swap_arrays(bit, R0_A, R1_A, top_w);
-
-                ct_mont_mul(m1, R0_A, R1_A, mont, top_w, ct_tmp); 
-                ct_mod_sub(R1_A, m1, c_mont, w1, top_w, ct_tmp);
-
-                ct_mont_mul(m2, R0_A, R0_A, mont, top_w, ct_tmp); 
-                ct_mod_sub(R0_A, m2, mont_two, w1, top_w, ct_tmp);
-
-                ct_swap_arrays(bit, R0_A, R1_A, top_w);
-            }
-
-            ct_mont_mul(temp_A, R0_A, plain_one, mont, top_w, ct_tmp); 
-            
-            ct_bn_copy(temp_B, plain_two, top_w);
-            
-            ct_mod_sub(m1, temp_A, temp_B, w1, top_w, ct_tmp);      
-            ct_mod_sub(m2, temp_A, w_minus_two, w1, top_w, ct_tmp); 
-            
-            int pass_this_round = ct_bn_is_zero(m1, top_w) | ct_bn_is_zero(m2, top_w);
-            is_composite |= (1 - pass_this_round);
-        }
-
-        OPENSSL_free(batch_P); 
-        OPENSSL_free(batch_m3); 
-        OPENSSL_free(batch_inv);
-    }
-
-    *status = is_composite ? BN_PRIMETEST_COMPOSITE : BN_PRIMETEST_PROBABLY_PRIME;
-    ret = 1;
-
-err:
-    BN_CTX_end(ctx);
-    BN_MONT_CTX_free(mont);
-    return ret;
-}
-
-/*
- * Solovay-Strassen Probabilistic Primality Test
- * * Computes:
- * 1. Jacobi symbol j = (a/w)
- * 2. Euler criterion x = a^{(w-1)/2} mod w
- * If x != j mod w, then w is composite.
- */
-/*
- * Constant-Time Solovay-Strassen Probabilistic Primality Test
- */
-/*
- * Constant-Time Solovay-Strassen Probabilistic Primality Test (100% CT Fixed)
- */
-int ossl_bn_solovay_strassen_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx,
-                                      BN_GENCB *cb, int *status)
-{
-    int i, ret = 0, j_val;
-    BIGNUM *w1, *w_minus_2, *a, *x, *e;
-    BIGNUM *expected, *bn_w1_copy, *diff, *ct_tmp, *plain_one;
-    BN_MONT_CTX *mont = NULL;
-
-    /* 基礎排除 (發生在加密運算前，允許非 CT) */
-    if (!BN_is_odd(w)) return 0;
-    if (BN_cmp(w, BN_value_one()) <= 0) return 0;
-    if (BN_is_word(w, 3)) { 
-        *status = BN_PRIMETEST_PROBABLY_PRIME; 
-        return 1; 
-    }
-
-    BN_CTX_start(ctx);
-    
-    w1 = BN_CTX_get(ctx); w_minus_2 = BN_CTX_get(ctx);
-    a = BN_CTX_get(ctx); x = BN_CTX_get(ctx); e = BN_CTX_get(ctx);
-    expected = BN_CTX_get(ctx); bn_w1_copy = BN_CTX_get(ctx);
-    diff = BN_CTX_get(ctx); ct_tmp = BN_CTX_get(ctx);
-    plain_one = BN_CTX_get(ctx); /* ✅ 新增給 ct_mod_exp_mont_ladder 使用 */
-
-    if (plain_one == NULL) goto err;
-
-    /* w1 = w - 1 */
-    if (!BN_copy(w1, w) || !BN_sub_word(w1, 1)) goto err;
-    BN_set_flags(w1, BN_FLG_CONSTTIME);
-    int top_w = w1->top;
-
-    /* ✅ 暴力撐開所有參與運算的 BIGNUM，並透過你的 ct_pad_top 徹底清零 */
-    BIGNUM *all_vars[] = {w1, w_minus_2, a, x, e, expected, bn_w1_copy, diff, ct_tmp, plain_one};
-    for (int k = 0; k < 10; k++) {
-        if (!bn_wexpand(all_vars[k], top_w)) goto err;
-        ct_pad_top(all_vars[k], top_w); 
-    }
-
-    /* w_minus_2 = w - 2 (used for random generation boundary) */
-    if (!BN_copy(w_minus_2, w) || !BN_sub_word(w_minus_2, 2)) goto err;
-
-    /* e = (w-1)/2 */
-    if (!BN_rshift1(e, w1)) goto err;
-    BN_set_flags(e, BN_FLG_CONSTTIME);
-    ct_pad_top(e, top_w); /* ✅ 鎖死指數長度，保護 Ladder */
-
-    mont = BN_MONT_CTX_new();
-    if (mont == NULL || !BN_MONT_CTX_set(mont, w, ctx)) goto err;
-
-    /* 準備 plain_one */
-    BN_one(plain_one); 
-    ct_pad_top(plain_one, top_w);
-
-    int is_composite = 0; /* 累積合數標記 */
-    int w_bits_minus_1 = BN_num_bits(w) - 1; /* ✅ 提前算出位元數，保護隨機數生成 */
-
-    for (i = 0; i < iterations; ++i) {
-        if (!BN_priv_rand_ex(a, w_bits_minus_1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, 0, ctx)) goto err;
-        
-        /* ✅ 修正 1：CT 隨機數加法 */
-        ct_pad_top(a, top_w); 
-        ct_bn_add_word(a, 2, top_w); 
-
-        /* Step 1: Compute Jacobi symbol j = (a/w) */
-        j_val = ossl_bn_jacobi_by(a, w, ctx);
-        
-        /* Step 2: Compute x = a^{(w-1)/2} mod w */
-        if (!ct_mod_exp_mont_ladder(x, a, e, mont, top_w, ctx, plain_one, ct_tmp)) goto err;
-
-        /* =========================================================
-         * Step 3: Constant-Time Euler Criterion Check
-         * ========================================================= */
-        int is_j_zero = (j_val == 0);
-        int is_j_minus_1 = (j_val == -1);
-
-        /* ✅ 修正 2：CT 賦值 1 */
-        ct_bn_copy(expected, plain_one, top_w); 
-        
-        ct_bn_copy_padded(bn_w1_copy, w1, top_w);
-
-        ct_swap_arrays(is_j_minus_1, expected, bn_w1_copy, top_w);
-        ct_mod_sub(diff, x, expected, w, top_w, ct_tmp);
-
-        int pass_this_round = ct_bn_is_zero(diff, top_w) & (1 - is_j_zero);
-        is_composite |= (1 - pass_this_round);
-    }
-
-    *status = is_composite ? BN_PRIMETEST_COMPOSITE : BN_PRIMETEST_PROBABLY_PRIME;
-    ret = 1;
-
-err:
-    BN_CTX_end(ctx);
-    BN_MONT_CTX_free(mont);
-    return ret;
-}
-
-
-
-/* ====================================================================
- * CCS 2026 Submission: Amortized Hybrid SS-Vset Engine (100% CT + Batch Inversion)
- * ==================================================================== */
-int ossl_bn_ss_vset_hybrid_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx,
-                                    BN_GENCB *cb, int *status)
-{
-    int i, j, bit, bit_len, ret = 0;
-    
-    BIGNUM *w_ct, *w_minus_1, *w_minus_2;
-    BIGNUM *e_vset, *e_ss, *D, *D_mont, *P, *mont_one, *mont_two, *c_mont;
-    BIGNUM *R0_A, *R1_A, *x_ss, *expected_ss, *tmp_base, *bn_w1_copy;
-    BIGNUM *m1, *m2, *m3, *temp_A, *temp_B, *ct_tmp, *plain_one, *plain_two;
-    BN_MONT_CTX *mont = NULL;
-    int is_composite = 0;
-
-    if (!BN_is_odd(w)) return 0;
-    if (BN_cmp(w, BN_value_one()) <= 0) return 0;
-    if (BN_is_word(w, 3)) { 
-        *status = BN_PRIMETEST_PROBABLY_PRIME; 
-        return 1; 
-    }
-
-    BN_CTX_start(ctx);
-    
-    w_ct = BN_CTX_get(ctx); w_minus_1 = BN_CTX_get(ctx); w_minus_2 = BN_CTX_get(ctx);
-    e_vset = BN_CTX_get(ctx); e_ss = BN_CTX_get(ctx);
-    D = BN_CTX_get(ctx); D_mont = BN_CTX_get(ctx); P = BN_CTX_get(ctx); 
-    mont_one = BN_CTX_get(ctx); mont_two = BN_CTX_get(ctx); c_mont = BN_CTX_get(ctx);
-    R0_A = BN_CTX_get(ctx); R1_A = BN_CTX_get(ctx); 
-    x_ss = BN_CTX_get(ctx); expected_ss = BN_CTX_get(ctx); tmp_base = BN_CTX_get(ctx);
-    bn_w1_copy = BN_CTX_get(ctx);
-    m1 = BN_CTX_get(ctx); m2 = BN_CTX_get(ctx); m3 = BN_CTX_get(ctx); 
-    temp_A = BN_CTX_get(ctx); temp_B = BN_CTX_get(ctx); ct_tmp = BN_CTX_get(ctx); 
-    plain_one = BN_CTX_get(ctx); plain_two = BN_CTX_get(ctx);
-
-    if (plain_two == NULL) goto err;
-
-    if (!BN_copy(w_ct, w)) goto err;
-    BN_set_flags(w_ct, BN_FLG_CONSTTIME);
-    int top_w = w_ct->top;
-
-    if (!BN_copy(w_minus_1, w) || !BN_sub_word(w_minus_1, 1)) goto err;
-    BN_set_flags(w_minus_1, BN_FLG_CONSTTIME);
-
-    if (!BN_copy(w_minus_2, w) || !BN_sub_word(w_minus_2, 2)) goto err;
-    BN_set_flags(w_minus_2, BN_FLG_CONSTTIME);
-
-    BIGNUM *vars[] = {w_ct, w_minus_1, w_minus_2, e_vset, e_ss, D, D_mont, P, mont_one, mont_two, c_mont,
-                      R0_A, R1_A, x_ss, expected_ss, tmp_base, bn_w1_copy,
-                      m1, m2, m3, temp_A, temp_B, ct_tmp, plain_one, plain_two};
-    for (i = 0; i < 25; i++) {
-        if (!bn_wexpand(vars[i], top_w)) goto err;
-        ct_pad_top(vars[i], top_w);
-    }
-
-    mont = BN_MONT_CTX_new();
-    if (mont == NULL || !BN_MONT_CTX_set(mont, w_ct, ctx)) goto err;
-
-    BN_one(plain_one); ct_pad_top(plain_one, top_w);
-    BN_set_word(plain_two, 2); ct_pad_top(plain_two, top_w);
-    BN_set_word(temp_A, 2); ct_pad_top(temp_A, top_w);
-
-    int found_D_mask = 0;
-    int is_3_mod_4 = BN_is_bit_set(w_ct, 1);
-    
-    BN_zero(D); ct_pad_top(D, top_w);
-
-    ct_bn_copy_padded(e_ss, w_minus_1, top_w); 
-    ct_bn_rshift1(e_ss, top_w);
-
-    int target_j_val = is_3_mod_4 ? 1 : -1;
-    int constSS = 8;
-    int w_bits_minus_1 = BN_num_bits(w_ct) - 1; 
-    
-    for (i = 0; i < constSS; i++) {
-        if (!BN_priv_rand_ex(tmp_base, w_bits_minus_1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, 0, ctx)) goto err;
-        ct_pad_top(tmp_base, top_w);
-        ct_bn_add_word(tmp_base, 2, top_w); 
-
-        int j_val = ossl_bn_jacobi_by(tmp_base, w_ct, ctx); 
-        
-        if (!ct_mod_exp_mont_ladder(x_ss, tmp_base, e_ss, mont, top_w, ctx, plain_one, ct_tmp)) goto err; 
-        
-        int is_match = (j_val == target_j_val);
-        int update_D = is_match & (!found_D_mask);
-        ct_swap_arrays(update_D, D, tmp_base, top_w);
-        found_D_mask |= update_D; 
-
-        int is_j_zero = (j_val == 0);
-        int is_j_minus_1 = (j_val == -1); 
-
-        BN_one(expected_ss); ct_pad_top(expected_ss, top_w);
-        ct_bn_copy_padded(bn_w1_copy, w_minus_1, top_w);
-
-        ct_swap_arrays(is_j_minus_1, expected_ss, bn_w1_copy, top_w);
-        ct_mod_sub(m1, x_ss, expected_ss, w_ct, top_w, ct_tmp); 
-
-        int pass_this_round = ct_bn_is_zero(m1, top_w) & (1 - is_j_zero);
-        is_composite |= (1 - pass_this_round);
-    }
-
-    int totalSmallPrimeTry = 25 - constSS;
-    static const int small_primes[25] = {3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101};
-    for (i = 0; i < totalSmallPrimeTry; i++) {
-        BN_set_word(tmp_base, small_primes[i]);
-        ct_pad_top(tmp_base, top_w);
-
-        int j_val = ossl_bn_jacobi_by(tmp_base, w_ct, ctx); 
-        
-        int is_match = (j_val == target_j_val);
-        int update_D = is_match & (!found_D_mask);
-        ct_swap_arrays(update_D, D, tmp_base, top_w);
-        found_D_mask |= update_D; 
-    }
-
-    is_composite |= (1 - found_D_mask);
-
-    ct_bn_copy_padded(e_vset, w_ct, top_w);
-    
-    BN_ULONG add_val = is_3_mod_4 ? 0 : 1;
-    BN_ULONG sub_val = is_3_mod_4 ? 1 : 0;
-    
-    BN_ULONG c = add_val;
-    for (int k = 0; k < top_w; k++) {
-        BN_ULONG sum = e_vset->d[k] + c;
-        c = (sum < e_vset->d[k]) ? 1 : 0;
-        e_vset->d[k] = sum;
-    }
-    c = sub_val;
-    for (int k = 0; k < top_w; k++) {
-        BN_ULONG diff = e_vset->d[k] - c;
-        c = (e_vset->d[k] < c) ? 1 : 0;
-        e_vset->d[k] = diff;
-    }
-    
-    ct_bn_rshift1(e_vset, top_w);
-    bit_len = BN_num_bits(w_ct) - 1; 
-
-    ct_mont_mul(D_mont, D, &(mont->RR), mont, top_w, ct_tmp);
-    ct_mont_mul(mont_one, plain_one, &(mont->RR), mont, top_w, ct_tmp);
-    ct_mont_mul(mont_two, temp_A, &(mont->RR), mont, top_w, ct_tmp);
-
-    int vset_iters = iterations - constSS;
-    if (vset_iters < 0) vset_iters = 0;
-
-    if (vset_iters > 0) {
-        BIGNUM **batch_P = OPENSSL_malloc(vset_iters * sizeof(BIGNUM *));
-        BIGNUM **batch_m3 = OPENSSL_malloc(vset_iters * sizeof(BIGNUM *));
-        BIGNUM **batch_inv = OPENSSL_malloc(vset_iters * sizeof(BIGNUM *));
-
-        if (batch_P == NULL || batch_m3 == NULL || batch_inv == NULL) {
-            if (batch_P) OPENSSL_free(batch_P);
-            if (batch_m3) OPENSSL_free(batch_m3);
-            if (batch_inv) OPENSSL_free(batch_inv);
-            goto err;
-        }
-
-        for (int k = 0; k < vset_iters; k++) {
-            batch_P[k] = BN_CTX_get(ctx);
-            batch_m3[k] = BN_CTX_get(ctx);
-            batch_inv[k] = BN_CTX_get(ctx);
-            if (batch_P[k] == NULL || batch_m3[k] == NULL || batch_inv[k] == NULL) goto err;
-            bn_wexpand(batch_P[k], top_w); ct_pad_top(batch_P[k], top_w);
-            bn_wexpand(batch_m3[k], top_w); ct_pad_top(batch_m3[k], top_w);
-            bn_wexpand(batch_inv[k], top_w); ct_pad_top(batch_inv[k], top_w);
-        }
-
-        /* Phase 1 */
-        for (int k = 0; k < vset_iters; k++) {
-            if (!BN_priv_rand_ex(batch_P[k], w_bits_minus_1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, 0, ctx)) goto err;
-            ct_pad_top(batch_P[k], top_w); 
-            ct_bn_add_word(batch_P[k], 1, top_w); 
-
-            ct_mont_mul(m1, batch_P[k], &(mont->RR), mont, top_w, ct_tmp);
-            ct_mont_mul(m1, m1, m1, mont, top_w, ct_tmp); 
-            ct_mont_mul(m1, m1, plain_one, mont, top_w, ct_tmp); 
-
-            ct_mod_sub(batch_m3[k], m1, D, w_ct, top_w, ct_tmp);          
-        }
-
-        /* Phase 2: Batch Inversion */
-        if (!ct_batch_invert_mont(batch_inv, batch_m3, vset_iters, w_ct, top_w, ctx, mont, plain_one, ct_tmp, &is_composite)) {
-            goto err;
-        }
-
-        /* Phase 3 */
-        for (int k = 0; k < vset_iters; k++) {
-            ct_mont_mul(m1, batch_P[k], &(mont->RR), mont, top_w, ct_tmp);
-            ct_mont_mul(m1, m1, m1, mont, top_w, ct_tmp); 
-            ct_mont_mul(m1, m1, plain_one, mont, top_w, ct_tmp); 
-            ct_mod_add(m2, m1, D, w_ct, top_w, ct_tmp);
-
-            ct_bn_copy(temp_A, batch_inv[k], top_w);
-            
-            ct_mont_mul(m2, m2, &(mont->RR), mont, top_w, ct_tmp);
-            ct_mont_mul(temp_A, temp_A, &(mont->RR), mont, top_w, ct_tmp);
-            ct_mont_mul(temp_B, m2, temp_A, mont, top_w, ct_tmp);
-            ct_mont_mul(temp_B, temp_B, plain_one, mont, top_w, ct_tmp);
-            
-            ct_mod_add(temp_B, temp_B, temp_B, w_ct, top_w, ct_tmp); 
-
-            ct_mont_mul(c_mont, temp_B, &(mont->RR), mont, top_w, ct_tmp); 
-            ct_bn_copy(R1_A, c_mont, top_w);                       
-            ct_bn_copy(R0_A, mont_two, top_w);                     
-
-            for (j = bit_len - 1; j >= 0; --j) {
-                int word_idx = j / BN_BITS2;
-                int bit_idx = j % BN_BITS2;
-                bit = (int)((e_vset->d[word_idx] >> bit_idx) & 1);
-
-                ct_swap_arrays(bit, R0_A, R1_A, top_w);
-
-                ct_mont_mul(m1, R0_A, R1_A, mont, top_w, ct_tmp); 
-                ct_mod_sub(R1_A, m1, c_mont, w_ct, top_w, ct_tmp);
-
-                ct_mont_mul(m2, R0_A, R0_A, mont, top_w, ct_tmp); 
-                ct_mod_sub(R0_A, m2, mont_two, w_ct, top_w, ct_tmp);
-
-                ct_swap_arrays(bit, R0_A, R1_A, top_w);
-            }
-
-            ct_mont_mul(temp_A, R0_A, plain_one, mont, top_w, ct_tmp); 
-            
-            ct_bn_copy(temp_B, plain_two, top_w);
-            
-            ct_mod_sub(m1, temp_A, temp_B, w_ct, top_w, ct_tmp);      
-            ct_mod_sub(m2, temp_A, w_minus_2, w_ct, top_w, ct_tmp); 
-            
-            int pass_this_round = ct_bn_is_zero(m1, top_w) | ct_bn_is_zero(m2, top_w);
-            is_composite |= (1 - pass_this_round);
-        }
-
-        OPENSSL_free(batch_P); 
-        OPENSSL_free(batch_m3); 
-        OPENSSL_free(batch_inv);
-    }
-
-    *status = is_composite ? BN_PRIMETEST_COMPOSITE : BN_PRIMETEST_PROBABLY_PRIME;
-    ret = 1;
-
-err:
-    BN_CTX_end(ctx);
-    BN_MONT_CTX_free(mont);
-    return ret;
-}
-
-/* ====================================================================
- * 內部硬體級常數時間輔助函式 (Hardware-level CT Helpers)
- * ==================================================================== */
-
-/* 🔥 CT 輔助：整數常數時間大於等於 (a >= b 回傳 1，否則回傳 0) 🔥 */
-
-
-/* 常數時間等於 (a == b 回傳 1，否則回傳 0) */
-static int ct_eq_int(int a, int b) {
-    unsigned int diff = (unsigned int)(a ^ b);
-    return (int)(1 - ((diff | (~diff + 1)) >> 31));
-}
-
-/* 常數時間大於等於 (a >= b 回傳 1，否則回傳 0) */
-static int ct_ge_int(int a, int b) {
-    return (int)(1 - (((unsigned int)(a - b)) >> 31)); 
-}
-
-/* 🔥 新增：常數時間 BIGNUM 相等檢查 (純 XOR 壓縮，取代肥大的 ct_mod_sub) 🔥 
- * 保證執行時間僅與 top 長度有關，與數值內容完全無關。
- */
-static int ct_bn_equal(const BIGNUM *a, const BIGNUM *b, int top) {
-    BN_ULONG diff = 0;
-    for (int k = 0; k < top; k++) {
-        diff |= (a->d[k] ^ b->d[k]); /* 只要有任何 bit 不同，diff 的對應 bit 就會變 1 */
-    }
-    
-    /* 常數時間判斷 diff 是否為 0：
-     * 若 diff == 0，(~diff + 1) 為 0，位移後為 0，1 - 0 = 1 (代表相等)。
-     * 若 diff != 0，diff 或其二補數的最高位元必定為 1，位移後得到 1，1 - 1 = 0 (代表不相等)。
-     * 注意：BN_BITS2 是 OpenSSL 定義的 BN_ULONG 位元數 (通常為 64 或 32)。
-     */
-    return (int)(1 - ((diff | (~diff + 1)) >> (BN_BITS2 - 1)));
-}
-
-
-/* ====================================================================
- * 最強對照組：Unified Single-Loop Constant-Time Miller-Rabin (100% CT Fixed)
- * 優化版：使用輕量級 ct_bn_equal 取代 Inner Loop 中的大數減法
- * ==================================================================== */
-int ossl_bn_miller_rabin_is_prime_unified(const BIGNUM *w, int iterations, BN_CTX *ctx,
-                                          BN_GENCB *cb, int *status)
-{
-    int i, j, ret = 0;
-    BIGNUM *w1, *w3, *b, *R0, *R1, *t1;
-    /* 🚀 已經移除了原本的 diff 變數，節省記憶體配置與操作 🚀 */
-    BIGNUM *mont_one, *mont_w1, *ct_tmp, *plain_one; 
-    BN_MONT_CTX *mont = NULL;
-
-    if (!BN_is_odd(w)) return 0;
-    if (BN_cmp(w, BN_value_one()) <= 0) return 0;
-    if (BN_is_word(w, 3)) { *status = BN_PRIMETEST_PROBABLY_PRIME; return 1; }
-
-    BN_CTX_start(ctx);
-    w1 = BN_CTX_get(ctx); w3 = BN_CTX_get(ctx); b = BN_CTX_get(ctx);
-    R0 = BN_CTX_get(ctx); R1 = BN_CTX_get(ctx); t1 = BN_CTX_get(ctx);
-    mont_one = BN_CTX_get(ctx); mont_w1 = BN_CTX_get(ctx);
-    ct_tmp = BN_CTX_get(ctx); plain_one = BN_CTX_get(ctx);
-
-    if (plain_one == NULL) goto err;
-
-    if (!BN_copy(w1, w) || !BN_sub_word(w1, 1)) goto err;
-    BN_set_flags(w1, BN_FLG_CONSTTIME);
-    int top_w = w1->top;
-    int bit_len = BN_num_bits(w1);
-    int w_bits_minus_1 = BN_num_bits(w) - 1; /* 供安全亂數使用 */
-
-    if (!BN_copy(w3, w) || !BN_sub_word(w3, 3)) goto err;
-
-    /* 陣列大小從 11 降為 10 */
-    BIGNUM *all_vars[] = {w1, w3, b, R0, R1, t1, mont_one, mont_w1, ct_tmp, plain_one};
-    for (int k = 0; k < 10; k++) {
-        if (!bn_wexpand(all_vars[k], top_w)) goto err;
-        ct_pad_top(all_vars[k], top_w); 
-    }
-
-    BN_one(plain_one); ct_pad_top(plain_one, top_w); /* 準備純量 1 */
-
-    /* 掃描 s (Trailing zeros) - 這段位元操作是 CT 的 */
-    int s = 0;
-    int found_one = 0;
-    for (int k = 0; k < bit_len; k++) {
-        int word_idx = k / BN_BITS2;
-        int bit_idx = k % BN_BITS2;
-        int bit_val = (int)((w1->d[word_idx] >> bit_idx) & 1);
-        found_one |= bit_val;
-        s += (1 - found_one);
-    }
-
-    mont = BN_MONT_CTX_new();
-    if (mont == NULL || !BN_MONT_CTX_set(mont, w, ctx)) goto err;
-
-    /* 改用 ct_mont_mul 乘以 RR 來初始化 Montgomery 空間變數 */
-    ct_mont_mul(mont_one, plain_one, &(mont->RR), mont, top_w, ct_tmp);
-    ct_mont_mul(mont_w1, w1, &(mont->RR), mont, top_w, ct_tmp);
-
-    if (iterations == 0) iterations = bn_mr_min_checks(BN_num_bits(w));
-
-    int is_composite = 0;
-
-    for (i = 0; i < iterations; ++i) {
-        /* 直接產出少一個 bit 的亂數，加上 2 確保大於等於 2 */
-        if (!BN_priv_rand_ex(b, w_bits_minus_1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, 0, ctx)) goto err;
-        ct_pad_top(b, top_w);
-        ct_bn_add_word(b, 2, top_w);
-
-        ct_bn_copy(R0, mont_one, top_w); 
-        ct_mont_mul(R1, b, &(mont->RR), mont, top_w, ct_tmp); 
-
-        int pass_this_round = 0;
-
-        /* Constant-Time Montgomery Ladder Inner Loop */
-        for (j = bit_len - 1; j >= 0; --j) {
-            int word_idx = j / BN_BITS2;
-            int bit_idx = j % BN_BITS2;
-            int bit_val = (int)((w1->d[word_idx] >> bit_idx) & 1);
-
-            ct_swap_arrays(bit_val, R0, R1, top_w);
-
-            /* 不帶正確 top 的陣列級蒙哥馬利乘法 */
-            ct_mont_mul(t1, R0, R1, mont, top_w, ct_tmp);
-            ct_mont_mul(R0, R0, R0, mont, top_w, ct_tmp);
-            
-            ct_bn_copy(R1, t1, top_w);
-            ct_swap_arrays(bit_val, R0, R1, top_w);
-
-            /* 🚀 效能優化核心：移除 ct_mod_sub，使用極速 XOR 陣列比對 🚀 */
-            int is_one = ct_bn_equal(R0, mont_one, top_w);
-            int is_w_minus_1 = ct_bn_equal(R0, mont_w1, top_w);
-
-            int is_at_s = ct_eq_int(j, s);
-            int is_in_range = ct_ge_int(s, j) & ct_ge_int(j, 1);
-
-            pass_this_round |= (is_at_s & is_one);
-            pass_this_round |= (is_in_range & is_w_minus_1);
-        }
-
-        is_composite |= (1 - pass_this_round);
-        
-        /* ⚠️ 跑 dudect 測試時，建議保持 callback 註解掉以免 I/O 干擾時序 */
-        /* if (!BN_GENCB_call(cb, 1, i)) goto err; */
-    }
-
-    *status = is_composite ? BN_PRIMETEST_COMPOSITE : BN_PRIMETEST_PROBABLY_PRIME;
-    ret = 1;
-
-err:
-    BN_CTX_end(ctx); BN_MONT_CTX_free(mont);
-    return ret;
-}
-
 /*
  * Refer to FIPS 186-4 C.3.2 Enhanced Miller-Rabin Probabilistic Primality Test.
  * OR C.3.1 Miller-Rabin Probabilistic Primality Test (if enhanced is zero).
@@ -1892,3 +617,1302 @@ err:
 }
 
 
+/* ====================================================================
+ * 1. Constant-Time Auxiliary Functions (Integer Level)
+ * ==================================================================== */
+
+/* Returns 1 if val >= 0, otherwise 0 (for 2's complement signed integers) */
+static inline int64_t ct_is_ge_zero(int64_t val) {
+    return (int64_t)(((uint64_t)val >> 63) ^ 1);
+}
+
+/* Checks if uint64_t is non-zero: returns 1 if v > 0, returns 0 if v == 0 */
+static inline int64_t ct_is_nz_u64(uint64_t v) {
+    return (int64_t)((v | (~v + 1)) >> 63) & 1;
+}
+
+/* Returns an all-1 mask (0xFF...F) if bit is 1, returns 0 if bit is 0 */
+static inline int64_t ct_mask_64(int64_t bit) {
+    return -(bit & 1);
+}
+
+/* Constant-time select: chooses a or b based on the mask */
+static inline int64_t ct_select_64(int64_t mask, int64_t a, int64_t b) {
+    return (mask & a) | (~mask & b);
+}
+
+/* Branchless implementation of arithmetic right shift by 1 bit (Floor division) */
+static inline int64_t ct_asr_1(int64_t val) {
+    int64_t mask = ct_mask_64(val < 0);
+    return ct_select_64(mask, ~((~val) >> 1), val >> 1);
+}
+
+/* Constant-time equality (returns 1 if a == b, otherwise returns 0) */
+static int ct_eq_int(int a, int b) {
+    unsigned int diff = (unsigned int)(a ^ b);
+    return (int)(1 - ((diff | (~diff + 1)) >> 31));
+}
+
+/* Constant-time greater than or equal (returns 1 if a >= b, otherwise returns 0) */
+static int ct_ge_int(int a, int b) {
+    return (int)(1 - (((unsigned int)(a - b)) >> 31)); 
+}
+
+/* ====================================================================
+ * 2. Fixed-Length BIGNUM (CT_BIGNUM) Configuration
+ * ==================================================================== */
+#define INPUT_LIMBS 32 
+#define WORK_LIMBS (INPUT_LIMBS + 2)
+
+static void ct_bn_cond_negate(uint64_t *x, int64_t mask) {
+    uint64_t carry = mask & 1;
+    for (int i = 0; i < WORK_LIMBS; i++) {
+        uint64_t inv = x[i] ^ mask;
+        x[i] = inv + carry;
+        carry = (x[i] < inv) ? 1 : 0;
+    }
+}
+
+static void ct_bn_from_openssl(uint64_t *out, const BIGNUM *in) {
+    unsigned char buf[INPUT_LIMBS * 8];
+    memset(buf, 0, sizeof(buf));
+    
+    BN_bn2lebinpad(in, buf, sizeof(buf)); 
+    
+    for (int i = 0; i < INPUT_LIMBS; i++) {
+        uint64_t limb = 0;
+        for(int j = 0; j < 8; j++) {
+            limb |= ((uint64_t)buf[i * 8 + j]) << (j * 8);
+        }
+        out[i] = limb;
+    }
+    for (int i = INPUT_LIMBS; i < WORK_LIMBS; i++) out[i] = 0;
+    
+    if (BN_is_negative(in)) {
+        ct_bn_cond_negate(out, -1);
+    }
+}
+
+static void ct_bn_add(uint64_t *res, const uint64_t *a, const uint64_t *b) {
+    uint64_t carry = 0;
+    for (int i = 0; i < WORK_LIMBS; i++) {
+        uint64_t sum1 = a[i] + b[i];
+        uint64_t c1 = (sum1 < a[i]) ? 1 : 0;
+        res[i] = sum1 + carry;
+        uint64_t c2 = (res[i] < sum1) ? 1 : 0;
+        carry = c1 | c2;
+    }
+}
+
+static void ct_bn_mul_signed(uint64_t *out, const uint64_t *in, int64_t multiplier) {
+    int64_t mask_neg = ct_mask_64(multiplier < 0);
+    uint64_t abs_m = (uint64_t)ct_select_64(mask_neg, -multiplier, multiplier);
+    
+    uint64_t temp[WORK_LIMBS];
+    for (int i = 0; i < WORK_LIMBS; i++) temp[i] = in[i];
+    
+    ct_bn_cond_negate(temp, mask_neg);
+    
+    uint64_t carry = 0;
+    for (int i = 0; i < WORK_LIMBS; i++) {
+        unsigned __int128 p = (unsigned __int128)temp[i] * abs_m + carry;
+        out[i] = (uint64_t)p;
+        carry = (uint64_t)(p >> 64);
+    }
+}
+
+static void ct_bn_rshift(uint64_t *x, int shift) {
+    if (shift == 0) return;
+    uint64_t sign_ext = ((int64_t)x[WORK_LIMBS - 1] < 0) ? (~0ULL << (64 - shift)) : 0;
+    
+    for (int i = 0; i < WORK_LIMBS - 1; i++) {
+        x[i] = (x[i] >> shift) | (x[i + 1] << (64 - shift));
+    }
+    x[WORK_LIMBS - 1] = (x[WORK_LIMBS - 1] >> shift) | sign_ext;
+}
+
+static void batch_matrix(int64_t *x_io, int64_t *y_io, int64_t *delta_io, int batch,
+                         int64_t *a_out, int64_t *b_out, int64_t *c_out, int64_t *d_out, 
+                         uint64_t *u_acc) {
+    int64_t a = 1, b = 0, c = 0, d = 1;
+    int64_t x = *x_io, y = *y_io, delta = *delta_io;
+    uint64_t u = 0;
+    
+    for (int i = 0; i < batch; i++) {
+        int64_t yi = y;
+        int64_t mask_swap = ct_mask_64(ct_is_ge_zero(delta) & (x & 1));
+        int64_t mask_odd  = ct_mask_64(x & 1);
+
+        delta = ct_select_64(mask_swap, -delta, 1 + delta);
+
+        int64_t operand_y = ct_select_64(mask_swap, -y, ct_select_64(mask_odd, y, 0));
+        int64_t next_y    = ct_select_64(mask_swap, x, y);
+        x = ct_asr_1(x + operand_y);
+        y = next_y;
+
+        int64_t next_a = ct_select_64(mask_swap, a - c, ct_select_64(mask_odd, a + c, a));
+        int64_t next_b = ct_select_64(mask_swap, b - d, ct_select_64(mask_odd, b + d, b));
+        int64_t next_ci = ct_select_64(mask_swap, 2 * a, 2 * c);
+        int64_t next_di = ct_select_64(mask_swap, 2 * b, 2 * d);
+
+        a = next_a; b = next_b; c = next_ci; d = next_di;
+
+        uint64_t u_y = (uint64_t)y;
+        u += (((uint64_t)yi & u_y) ^ (uint64_t)ct_asr_1((int64_t)u_y)) & 2;
+        u += (u & 1) ^ (c < 0 ? 1 : 0);
+        u %= 4;
+    }
+    
+    *x_io = x; *y_io = y; *delta_io = delta;
+    *a_out = a; *b_out = b; *c_out = c; *d_out = d;
+    *u_acc = u;
+}
+
+/* ====================================================================
+ * 3. Internal Hardware-level Constant-Time Helpers
+ * ==================================================================== */
+
+static void ct_pad_top(BIGNUM *a, int target_top) {
+    int curr = a->top;
+    for (int i = 0; i < target_top; i++) {
+        BN_ULONG mask = (BN_ULONG)0 - (BN_ULONG)(i < curr);
+        a->d[i] &= mask;
+    }
+    a->top = target_top; 
+}
+
+static int ct_bn_is_zero(const BIGNUM *a, int target_top) {
+    BN_ULONG acc = 0;
+    for (int k = 0; k < target_top; k++) {
+        acc |= a->d[k];
+    }
+    return (acc == 0);
+}
+
+static void ct_swap_arrays(int swap, BIGNUM *A, BIGNUM *B, int top_w) {
+    BN_ULONG mask = 0 - (BN_ULONG)swap;
+    for (int i = 0; i < top_w; i++) {
+        BN_ULONG tmp = (A->d[i] ^ B->d[i]) & mask;
+        A->d[i] ^= tmp;
+        B->d[i] ^= tmp;
+    }
+}
+
+static void ct_mod_add(BIGNUM *r, const BIGNUM *a, const BIGNUM *b, const BIGNUM *m, int top_w, BIGNUM *tmp) {
+    BN_ULONG carry = bn_add_words(r->d, a->d, b->d, top_w);
+    r->top = top_w; r->neg = 0;
+    BN_ULONG borrow = bn_sub_words(tmp->d, r->d, m->d, top_w);
+    tmp->top = top_w; tmp->neg = 0;
+    ct_swap_arrays(carry | (1 - borrow), r, tmp, top_w);
+}
+
+static void ct_mod_sub(BIGNUM *r, const BIGNUM *a, const BIGNUM *b, const BIGNUM *m, int top_w, BIGNUM *tmp) {
+    BN_ULONG borrow = bn_sub_words(r->d, a->d, b->d, top_w);
+    r->top = top_w; r->neg = 0;
+    (void)bn_add_words(tmp->d, r->d, m->d, top_w);
+    tmp->top = top_w; tmp->neg = 0;
+    ct_swap_arrays(borrow, r, tmp, top_w);
+}
+
+static void ct_bn_copy(BIGNUM *dst, const BIGNUM *src, int top_w) {
+    for (int i = 0; i < top_w; i++) dst->d[i] = src->d[i];
+    dst->top = top_w; dst->neg = 0;
+}
+
+static void ct_bn_copy_padded(BIGNUM *dst, const BIGNUM *src, int top_w) {
+    for (int i = 0; i < top_w; i++) {
+        dst->d[i] = (i < src->top) ? src->d[i] : 0;
+    }
+    dst->top = top_w; dst->neg = 0;
+}
+
+static void ct_bn_rshift1(BIGNUM *a, int top_w) {
+    BN_ULONG carry = 0;
+    for (int i = top_w - 1; i >= 0; i--) {
+        BN_ULONG next_carry = (a->d[i] & 1) << (BN_BITS2 - 1);
+        a->d[i] = (a->d[i] >> 1) | carry;
+        carry = next_carry;
+    }
+    a->top = top_w;
+}
+
+static void ct_bn_add_word(BIGNUM *a, BN_ULONG w, int top_w) {
+    BN_ULONG c = w;
+    for (int i = 0; i < top_w; i++) {
+        BN_ULONG sum = a->d[i] + c;
+        c = (sum < a->d[i]) ? 1 : 0;
+        a->d[i] = sum;
+    }
+    a->top = top_w;
+}
+
+static void ct_mont_mul(BIGNUM *r, const BIGNUM *a, const BIGNUM *b, const BN_MONT_CTX *mont, int top_w, BIGNUM *tmp) {
+    bn_mul_mont(tmp->d, a->d, b->d, mont->N.d, mont->n0, top_w);
+    ct_bn_copy(r, tmp, top_w);
+}
+
+/* Constant-time BIGNUM equality check (Pure XOR compression, replaces heavy ct_mod_sub).
+ * Guarantees execution time depends only on top length, completely independent of value content.
+ */
+static int ct_bn_equal(const BIGNUM *a, const BIGNUM *b, int top) {
+    BN_ULONG diff = 0;
+    for (int k = 0; k < top; k++) {
+        diff |= (a->d[k] ^ b->d[k]); 
+    }
+    return (int)(1 - ((diff | (~diff + 1)) >> (BN_BITS2 - 1)));
+}
+
+/* ====================================================================
+ * 4. Complex Constant-Time Math Operations
+ * ==================================================================== */
+
+/* Constant-Time algorithm supporting both GCD and modular inversion */
+void ct_by_gcd_inv(BIGNUM *out_inv, BIGNUM *out_gcd, const BIGNUM *x, const BIGNUM *m, int top_w, BN_CTX *ctx) {
+    BN_CTX_start(ctx);
+    BIGNUM *A = BN_CTX_get(ctx); bn_wexpand(A, top_w); ct_pad_top(A, top_w);
+    BIGNUM *B = BN_CTX_get(ctx); bn_wexpand(B, top_w); ct_pad_top(B, top_w);
+    BIGNUM *U = BN_CTX_get(ctx); bn_wexpand(U, top_w); ct_pad_top(U, top_w);
+    BIGNUM *V = BN_CTX_get(ctx); bn_wexpand(V, top_w); ct_pad_top(V, top_w);
+    BIGNUM *tmp1 = BN_CTX_get(ctx); bn_wexpand(tmp1, top_w); ct_pad_top(tmp1, top_w);
+    BIGNUM *tmp2 = BN_CTX_get(ctx); bn_wexpand(tmp2, top_w); ct_pad_top(tmp2, top_w);
+    
+    ct_bn_copy_padded(A, m, top_w);
+    ct_bn_copy_padded(B, x, top_w);
+    BN_zero(U); ct_pad_top(U, top_w);
+    BN_one(V); ct_pad_top(V, top_w);
+    
+    int iters = 3 * top_w * BN_BITS2;
+    
+    for (int i = 0; i < iters; i++) {
+        int B_is_odd = B->d[0] & 1;
+        
+        BN_ULONG borrow = bn_sub_words(tmp1->d, A->d, B->d, top_w);
+        int swap = B_is_odd & (1 - (int)borrow);
+        
+        ct_swap_arrays(swap, A, B, top_w);
+        ct_swap_arrays(swap, U, V, top_w);
+        
+        bn_sub_words(tmp1->d, B->d, A->d, top_w);
+        ct_swap_arrays(B_is_odd, B, tmp1, top_w);
+        
+        ct_mod_sub(tmp2, V, U, m, top_w, tmp1);
+        ct_swap_arrays(B_is_odd, V, tmp2, top_w);
+        
+        ct_bn_rshift1(B, top_w);
+        
+        int V_is_odd = V->d[0] & 1;
+        BN_ULONG carry = bn_add_words(tmp1->d, V->d, m->d, top_w);
+        for (int j = 0; j < top_w - 1; j++) {
+            tmp1->d[j] = (tmp1->d[j] >> 1) | ((tmp1->d[j+1] & 1) << (BN_BITS2 - 1));
+        }
+        tmp1->d[top_w - 1] = (tmp1->d[top_w - 1] >> 1) | (carry << (BN_BITS2 - 1));
+        tmp1->top = top_w; tmp1->neg = 0;
+        
+        ct_bn_rshift1(V, top_w);
+        ct_swap_arrays(V_is_odd, V, tmp1, top_w);
+    }
+    
+    if (out_inv) ct_bn_copy(out_inv, U, top_w);
+    if (out_gcd) ct_bn_copy(out_gcd, A, top_w);
+    BN_CTX_end(ctx);
+}
+
+/* Wrapper dedicated for Lucas Test (retrieves inverse only) */
+void ct_by_invert(BIGNUM *out, const BIGNUM *x, const BIGNUM *m, int top_w, BN_CTX *ctx) {
+    ct_by_gcd_inv(out, NULL, x, m, top_w, ctx);
+}
+
+/* Original bn_mod_exp_mont_ladder (used by tests like Miller-Rabin) */
+static int bn_mod_exp_mont_ladder(BIGNUM *r, const BIGNUM *a, const BIGNUM *p,
+                                  const BIGNUM *m, BN_CTX *ctx, BN_MONT_CTX *mont) {
+    BIGNUM *R0, *R1, *t1;
+    int i, bit;
+    int top_m = m->top;
+    
+    BN_CTX_start(ctx);
+    R0 = BN_CTX_get(ctx);
+    R1 = BN_CTX_get(ctx);
+    t1 = BN_CTX_get(ctx);
+    
+    BN_one(R0);
+    BN_to_montgomery(R0, R0, mont, ctx);
+    BN_to_montgomery(R1, a, mont, ctx);
+    
+    bn_wexpand(R0, top_m); ct_pad_top(R0, top_m);
+    bn_wexpand(R1, top_m); ct_pad_top(R1, top_m);
+    bn_wexpand(t1, top_m); ct_pad_top(t1, top_m);
+    
+    for (i = BN_num_bits(p) - 1; i >= 0; i--) {
+        bit = BN_is_bit_set(p, i);
+        
+        ct_pad_top(R0, top_m); ct_pad_top(R1, top_m);
+        ct_swap_arrays(bit, R0, R1, top_m);
+        
+        BN_mod_mul_montgomery(t1, R0, R1, mont, ctx); 
+        BN_mod_mul_montgomery(R0, R0, R0, mont, ctx); 
+        BN_copy(R1, t1);                              
+        
+        ct_pad_top(R0, top_m); ct_pad_top(R1, top_m);
+        ct_swap_arrays(bit, R0, R1, top_m);
+    }
+    
+    BN_from_montgomery(r, R0, mont, ctx);
+    BN_CTX_end(ctx);
+    return 1;
+}
+
+static int ct_mod_exp_mont_ladder(BIGNUM *r, const BIGNUM *a, const BIGNUM *p, 
+                                  const BN_MONT_CTX *mont, int top_w, BN_CTX *ctx, 
+                                  BIGNUM *plain_one, BIGNUM *ct_tmp) {
+    BN_CTX_start(ctx);
+    BIGNUM *R0 = BN_CTX_get(ctx); bn_wexpand(R0, top_w); ct_pad_top(R0, top_w);
+    BIGNUM *R1 = BN_CTX_get(ctx); bn_wexpand(R1, top_w); ct_pad_top(R1, top_w);
+    
+    ct_mont_mul(R0, plain_one, &(mont->RR), mont, top_w, ct_tmp);
+    ct_mont_mul(R1, a, &(mont->RR), mont, top_w, ct_tmp);
+    
+    /* Note: The loop count depends on bit length, but since p is the public w_minus_1, length leakage is safe */
+    int p_bits = BN_num_bits(p); 
+    for (int i = p_bits - 1; i >= 0; i--) {
+        int word_idx = i / BN_BITS2;
+        int bit_idx = i % BN_BITS2;
+        int bit = (int)((p->d[word_idx] >> bit_idx) & 1);
+        
+        ct_swap_arrays(bit, R0, R1, top_w);
+        
+        ct_mont_mul(R1, R0, R1, mont, top_w, ct_tmp); 
+        ct_mont_mul(R0, R0, R0, mont, top_w, ct_tmp); 
+        
+        ct_swap_arrays(bit, R0, R1, top_w);
+    }
+    
+    ct_mont_mul(r, R0, plain_one, mont, top_w, ct_tmp);
+    BN_CTX_end(ctx);
+    return 1;
+}
+
+static int ct_batch_invert_mont(BIGNUM **X_inv, BIGNUM **X, int n, const BIGNUM *w, 
+                                int top_w, BN_CTX *ctx, BN_MONT_CTX *mont, 
+                                BIGNUM *plain_one, BIGNUM *ct_tmp, int *is_composite) 
+{
+    if (n <= 0) return 1;
+    int ret = 0;
+    BN_CTX_start(ctx);
+    
+    BIGNUM *I_all = BN_CTX_get(ctx);
+    BIGNUM *X_mont = BN_CTX_get(ctx);
+    BIGNUM **C = OPENSSL_malloc(n * sizeof(BIGNUM *)); 
+    
+    if (C == NULL || I_all == NULL || X_mont == NULL) goto end;
+    
+    bn_wexpand(I_all, top_w); ct_pad_top(I_all, top_w);
+    bn_wexpand(X_mont, top_w); ct_pad_top(X_mont, top_w);
+
+    for (int i = 0; i < n; i++) {
+        C[i] = BN_CTX_get(ctx);
+        if (C[i] == NULL) goto end;
+        bn_wexpand(C[i], top_w); ct_pad_top(C[i], top_w);
+        
+        int is_zero = ct_bn_is_zero(X[i], top_w);
+        *is_composite |= is_zero;
+        ct_swap_arrays(is_zero, X[i], plain_one, top_w);
+    }
+
+    ct_mont_mul(C[0], X[0], &(mont->RR), mont, top_w, ct_tmp); 
+    for (int i = 1; i < n; i++) {
+        ct_mont_mul(X_mont, X[i], &(mont->RR), mont, top_w, ct_tmp);
+        ct_mont_mul(C[i], C[i-1], X_mont, mont, top_w, ct_tmp); 
+    }
+
+    ct_by_invert(I_all, C[n-1], w, top_w, ctx);
+
+    for (int i = n - 1; i > 0; i--) {
+        ct_mont_mul(X_inv[i], I_all, C[i-1], mont, top_w, ct_tmp);
+        ct_mont_mul(X_inv[i], X_inv[i], &(mont->RR), mont, top_w, ct_tmp); 
+        
+        ct_mont_mul(X_mont, X[i], &(mont->RR), mont, top_w, ct_tmp);
+        ct_mont_mul(I_all, I_all, X_mont, mont, top_w, ct_tmp);
+    }
+    ct_mont_mul(X_inv[0], I_all, &(mont->RR), mont, top_w, ct_tmp); 
+
+    ret = 1;
+end:
+    if (C != NULL) OPENSSL_free(C);
+    BN_CTX_end(ctx);
+    return ret;
+}
+
+/* ====================================================================
+ * 5. Primality Testing Algorithms
+ * ==================================================================== */
+
+/* Jacobi symbol: Hamburg */
+int ossl_bn_jacobi_by(const BIGNUM *x_in, const BIGNUM *y_in, BN_CTX *ctx) {
+    uint64_t ct_x[WORK_LIMBS], ct_y[WORK_LIMBS];
+    
+    ct_bn_from_openssl(ct_x, x_in);
+    ct_bn_from_openssl(ct_y, y_in);
+
+    uint64_t y_zero_acc = 0;
+    for (int i = 0; i < WORK_LIMBS; i++) y_zero_acc |= ct_y[i];
+    int64_t mask_initial_y_zero = ct_mask_64(ct_is_nz_u64(y_zero_acc) ^ 1);
+    int64_t mask_initial_y_even = ct_mask_64((ct_y[0] & 1) ^ 1);
+
+    int x_neg = BN_is_negative(x_in);
+    int y_neg = BN_is_negative(y_in);
+    
+    /* Force x, y to be positive and compensate the sign to align with Safegcd and Kronecker symbol */
+    if (x_neg) ct_bn_cond_negate(ct_x, -1);
+    if (y_neg) ct_bn_cond_negate(ct_y, -1);
+
+    /* After forcing positive, simply take the lowest bits to get the correct |y| % 4 */
+    uint64_t abs_y_mod_4 = ct_y[0] & 3; 
+    
+    int sign_multiplier = 1;
+    if (x_neg && y_neg) sign_multiplier = -1;
+    if (x_neg && abs_y_mod_4 == 3) sign_multiplier = -sign_multiplier;
+
+    /* Ensure enough iterations are run (2048-bit upper bound) */
+    int max_bits = INPUT_LIMBS * 64; 
+    int niters = (45907 * max_bits + 26313) / 19929;
+    
+    int64_t delta = 0; 
+    uint64_t t = 0; 
+    int batch = 60; 
+    int num_loops = (niters + batch - 1) / batch + 2; 
+    uint64_t mask = (1ULL << (batch + 2)) - 1; 
+
+    for (int i = 0; i < num_loops; i++) {
+        int64_t x_prime = (int64_t)(ct_x[0] & mask);
+        int64_t y_prime = (int64_t)(ct_y[0] & mask);
+        
+        int64_t a_i, b_i, c_i, d_i;
+        uint64_t u_acc = 0;
+
+        batch_matrix(&x_prime, &y_prime, &delta, batch, &a_i, &b_i, &c_i, &d_i, &u_acc);
+
+        uint64_t tx_a[WORK_LIMBS], ty_b[WORK_LIMBS];
+        uint64_t tx_c[WORK_LIMBS], ty_d[WORK_LIMBS];
+
+        ct_bn_mul_signed(tx_a, ct_x, a_i);
+        ct_bn_mul_signed(ty_b, ct_y, b_i);
+        ct_bn_add(tx_a, tx_a, ty_b);  
+
+        ct_bn_mul_signed(tx_c, ct_x, c_i);
+        ct_bn_mul_signed(ty_d, ct_y, d_i);
+        ct_bn_add(tx_c, tx_c, ty_d);  
+
+        ct_bn_rshift(tx_a, batch);
+        ct_bn_rshift(tx_c, batch);
+        
+        for (int j = 0; j < WORK_LIMBS; j++) {
+            ct_x[j] = tx_a[j];
+            ct_y[j] = tx_c[j];
+        }
+        
+        t = (t + u_acc) % 4;
+        int y_sign = ((int64_t)ct_y[WORK_LIMBS - 1] < 0) ? 1 : 0;
+        t = (t + ((t & 1) ^ y_sign)) % 4;
+    }
+
+    t = (t + (t & 1)) % 4;
+    
+    uint64_t final_y_abs[WORK_LIMBS];
+    for (int i = 0; i < WORK_LIMBS; i++) final_y_abs[i] = ct_y[i];
+    int64_t final_y_neg = ct_mask_64(((int64_t)ct_y[WORK_LIMBS - 1] < 0) ? 1 : 0);
+    ct_bn_cond_negate(final_y_abs, final_y_neg); /* Take the absolute value of the result */
+
+    uint64_t y_high_or = 0;
+    for (int i = 1; i < WORK_LIMBS; i++) y_high_or |= final_y_abs[i];
+    
+    int64_t mask_y_high_zero = ct_mask_64(ct_is_nz_u64(y_high_or) ^ 1);
+    int64_t mask_y_d0_one = ct_mask_64((final_y_abs[0] == 1) ? 1 : 0);
+    int64_t mask_is_gcd_one = mask_y_high_zero & mask_y_d0_one; 
+    
+    int64_t mask_error = mask_initial_y_zero | mask_initial_y_even;
+    int expected_jacobi = 1 - (int)t;
+    int final_ret = (int)ct_select_64(mask_is_gcd_one, (int64_t)(sign_multiplier * expected_jacobi), 0);
+
+    return (int)ct_select_64(mask_error, 0, final_ret);
+}
+
+int ossl_bn_CHVL_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx,
+                           BN_GENCB *cb, int *status)
+{
+    int i, j, bit, bit_len, ret = 0;
+    BIGNUM *w1, *e, *D, *D_mont, *P, *mont_one, *mont_two, *w_minus_two, *c_mont;
+    BIGNUM *R0_A, *R0_B, *R1_A, *R1_B;
+    BIGNUM *m1, *m2, *m3, *tB1D, *temp_A, *temp_B, *tmp_prime, *ct_tmp, *plain_one, *plain_two;
+    BN_MONT_CTX *mont = NULL;
+    
+    if (!BN_is_odd(w)) return 0;
+
+    BN_CTX_start(ctx);
+    
+    w1 = BN_CTX_get(ctx); e = BN_CTX_get(ctx); 
+    D = BN_CTX_get(ctx); D_mont = BN_CTX_get(ctx);
+    P = BN_CTX_get(ctx); 
+    mont_one = BN_CTX_get(ctx); mont_two = BN_CTX_get(ctx);
+    w_minus_two = BN_CTX_get(ctx); c_mont = BN_CTX_get(ctx);
+    R0_A = BN_CTX_get(ctx); R0_B = BN_CTX_get(ctx);
+    R1_A = BN_CTX_get(ctx); R1_B = BN_CTX_get(ctx);
+    m1 = BN_CTX_get(ctx); m2 = BN_CTX_get(ctx); m3 = BN_CTX_get(ctx); 
+    tB1D = BN_CTX_get(ctx); temp_A = BN_CTX_get(ctx); temp_B = BN_CTX_get(ctx);
+    tmp_prime = BN_CTX_get(ctx); ct_tmp = BN_CTX_get(ctx); 
+    plain_one = BN_CTX_get(ctx); plain_two = BN_CTX_get(ctx);
+
+    if (plain_two == NULL) goto err;
+
+    if (!BN_copy(w1, w)) goto err;
+    BN_set_flags(w1, BN_FLG_CONSTTIME);
+
+    int top_w = w1->top;
+
+    BIGNUM *all_vars[] = {w1, e, D, D_mont, P, mont_one, mont_two, w_minus_two, c_mont,
+                          R0_A, R0_B, R1_A, R1_B, m1, m2, m3, tB1D, temp_A, temp_B, tmp_prime, ct_tmp, plain_one, plain_two};
+    for (int k = 0; k < 23; k++) {
+        if (!bn_wexpand(all_vars[k], top_w)) goto err;
+        ct_pad_top(all_vars[k], top_w);
+    }
+
+    /* ====================================================================
+     * Phase 1: Parameter Setup & CFindD Algorithm
+     * ==================================================================== */
+    
+    /* Algorithm CFindD Line 1: D <- 0, found <- false */
+    int found_mask = 0;
+    BN_zero(D); ct_pad_top(D, top_w);
+
+    /* Algorithm CFindD Line 2-3: J_target <- CTSelect(is_3_mod_4, 1, -1) */
+    int is_3_mod_4 = BN_is_bit_set(w, 1); 
+    int target_j_val = is_3_mod_4 ? 1 : -1;
+
+    static const int small_primes[] = {
+        3, 5, 7, 11, 13, 17, 19, 23, 29, 31,
+        37, 41, 43, 47, 53, 59, 61, 67, 71, 73,
+        79, 83, 89, 97, 101
+    };
+    
+    /* Algorithm CFindD Line 4: For p in L (strictly 25 iterations) */
+    for (int k = 0; k < 25; k++) {
+        BN_set_word(tmp_prime, small_primes[k]);
+        ct_pad_top(tmp_prime, top_w);
+
+        /* Algorithm CFindD Line 5: val <- ConstantTimeJacobi(p, n) */
+        int j_val = ossl_bn_jacobi_by(tmp_prime, w, ctx); 
+        
+        /* Algorithm CFindD Lines 6-8: Conditionally update D */
+        int is_match = (j_val == target_j_val);
+        int update = is_match & (!found_mask);
+        
+        ct_swap_arrays(update, D, tmp_prime, top_w);
+        found_mask |= update;
+    }
+
+    /* Algorithm CHVL Line 2: is_composite <- ~success */
+    int is_composite = (1 - found_mask);
+
+    /* Algorithm CHVL Lines 4-5: e <- (n + modifier) / 2 */
+    ct_bn_copy_padded(e, w1, top_w);
+    ct_bn_rshift1(e, top_w);
+    ct_bn_add_word(e, 1 - (int)is_3_mod_4, top_w);
+    
+    bit_len = BN_num_bits(w1) - 1; 
+
+    mont = BN_MONT_CTX_new();
+    if (mont == NULL || !BN_MONT_CTX_set(mont, w1, ctx)) goto err;
+    
+    BN_one(plain_one); ct_pad_top(plain_one, top_w);
+    BN_set_word(plain_two, 2); ct_pad_top(plain_two, top_w);
+
+    ct_mont_mul(D_mont, D, &(mont->RR), mont, top_w, ct_tmp);
+    ct_mont_mul(mont_one, plain_one, &(mont->RR), mont, top_w, ct_tmp);
+    ct_mont_mul(mont_two, plain_two, &(mont->RR), mont, top_w, ct_tmp);
+    
+    ct_mod_sub(w_minus_two, w1, plain_two, w1, top_w, ct_tmp);
+
+    int w_bits_minus_1 = BN_num_bits(w1) - 1;
+    
+    /* Dynamic split of iterations: Max 6 for Strong Lucas (ILPBP), rest for V-set (IVset) */
+    const int NUM_STRONG_TESTS = 6;
+    int strong_iters = (iterations < NUM_STRONG_TESTS) ? iterations : NUM_STRONG_TESTS;
+
+    /* ====================================================================
+     * Phase 3: Constant-Time Extension Ring Ladder (ILPBP Iterations)
+     * Note: Executed first in C implementation for early rejection
+     * ==================================================================== */
+    for (i = 0; i < strong_iters; ++i) {
+        /* Algorithm CHVL Line 12: P <-$ [1, n-1] */
+        if (!BN_priv_rand_ex(P, w_bits_minus_1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, 0, ctx)) goto err;
+        ct_pad_top(P, top_w); 
+        ct_bn_add_word(P, 1, top_w);
+
+        /* Algorithm CHVL Line 13: pass <- CSL(P, D, e, n) (Strong Lucas Evaluation) */
+        ct_mont_mul(R1_A, P, &(mont->RR), mont, top_w, ct_tmp); 
+        ct_bn_copy(R1_B, mont_one, top_w);
+        ct_bn_copy(R0_A, mont_one, top_w);
+        ct_mod_sub(R0_B, mont_one, mont_one, w1, top_w, ct_tmp); 
+
+        for (j = bit_len - 1; j >= 0; --j) {
+            int word_idx = j / BN_BITS2;
+            int bit_idx = j % BN_BITS2;
+            bit = (int)((e->d[word_idx] >> bit_idx) & 1);
+
+            ct_swap_arrays(bit, R0_A, R1_A, top_w);
+            ct_swap_arrays(bit, R0_B, R1_B, top_w);
+
+            ct_mod_add(m1, R0_A, R0_B, w1, top_w, ct_tmp);
+            ct_mod_add(m2, R1_A, R1_B, w1, top_w, ct_tmp);
+            
+            ct_mont_mul(m3, m1, m2, mont, top_w, ct_tmp); 
+            ct_mont_mul(m1, R0_A, R1_A, mont, top_w, ct_tmp); 
+            ct_mont_mul(m2, R0_B, R1_B, mont, top_w, ct_tmp); 
+            ct_mont_mul(tB1D, m2, D_mont, mont, top_w, ct_tmp); 
+            
+            ct_mod_add(R1_A, m1, tB1D, w1, top_w, ct_tmp);
+            ct_mod_sub(R1_B, m3, m1, w1, top_w, ct_tmp);
+            ct_mod_sub(R1_B, R1_B, m2, w1, top_w, ct_tmp);
+
+            ct_mont_mul(m3, R0_A, R0_B, mont, top_w, ct_tmp); 
+            ct_mont_mul(m1, R0_A, R0_A, mont, top_w, ct_tmp); 
+            ct_mont_mul(m2, R0_B, R0_B, mont, top_w, ct_tmp); 
+            ct_mont_mul(tB1D, m2, D_mont, mont, top_w, ct_tmp); 
+            
+            ct_mod_add(R0_A, m1, tB1D, w1, top_w, ct_tmp);
+            ct_mod_add(R0_B, m3, m3, w1, top_w, ct_tmp);
+
+            ct_swap_arrays(bit, R0_A, R1_A, top_w);
+            ct_swap_arrays(bit, R0_B, R1_B, top_w);
+        }
+
+        ct_mont_mul(temp_A, R0_A, plain_one, mont, top_w, ct_tmp); 
+        ct_mont_mul(temp_B, R0_B, plain_one, mont, top_w, ct_tmp); 
+
+        int pass_this_round = ct_bn_is_zero(temp_A, top_w) | ct_bn_is_zero(temp_B, top_w);
+        
+        /* Algorithm CHVL Line 14: is_composite <- is_composite | ~pass */
+        is_composite |= (1 - pass_this_round);
+    }
+
+    /* ====================================================================
+     * Phase 2: Amortized Setup & Constant-Time Trace Ladder (IVset)
+     * ==================================================================== */
+    int vset_iters = iterations - strong_iters;
+    if (vset_iters > 0) {
+        BIGNUM **batch_P = OPENSSL_malloc(vset_iters * sizeof(BIGNUM *));
+        BIGNUM **batch_m3 = OPENSSL_malloc(vset_iters * sizeof(BIGNUM *));
+        BIGNUM **batch_inv = OPENSSL_malloc(vset_iters * sizeof(BIGNUM *));
+
+        if (batch_P == NULL || batch_m3 == NULL || batch_inv == NULL) {
+            if (batch_P) OPENSSL_free(batch_P);
+            if (batch_m3) OPENSSL_free(batch_m3);
+            if (batch_inv) OPENSSL_free(batch_inv);
+            goto err;
+        }
+
+        for (int k = 0; k < vset_iters; k++) {
+            batch_P[k] = BN_CTX_get(ctx);
+            batch_m3[k] = BN_CTX_get(ctx);
+            batch_inv[k] = BN_CTX_get(ctx);
+            if (batch_P[k] == NULL || batch_m3[k] == NULL || batch_inv[k] == NULL) goto err;
+            bn_wexpand(batch_P[k], top_w); ct_pad_top(batch_P[k], top_w);
+            bn_wexpand(batch_m3[k], top_w); ct_pad_top(batch_m3[k], top_w);
+            bn_wexpand(batch_inv[k], top_w); ct_pad_top(batch_inv[k], top_w);
+        }
+
+        /* Algorithm CHVL Line 6: P <- Sample_Array(IVset, [1, n-1]) */
+        for (int k = 0; k < vset_iters; k++) {
+            if (!BN_priv_rand_ex(batch_P[k], w_bits_minus_1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, 0, ctx)) goto err;
+            ct_pad_top(batch_P[k], top_w); 
+            ct_bn_add_word(batch_P[k], 1, top_w); 
+
+            ct_mont_mul(m1, batch_P[k], &(mont->RR), mont, top_w, ct_tmp);
+            ct_mont_mul(m1, m1, m1, mont, top_w, ct_tmp); 
+            ct_mont_mul(m1, m1, plain_one, mont, top_w, ct_tmp); 
+
+            /* Compute P^2 - D for batch inversion */
+            ct_mod_sub(batch_m3[k], m1, D, w1, top_w, ct_tmp);          
+        }
+
+        /* Algorithm CHVL Line 7: (Inv, Coprime_Flags) <- CT_Batch_Invert({P^2 - D}) */
+        if (!ct_batch_invert_mont(batch_inv, batch_m3, vset_iters, w1, top_w, ctx, mont, plain_one, ct_tmp, &is_composite)) {
+            goto err;
+        }
+
+        /* Algorithm CHVL Line 8: For iter = 1 to IVset */
+        for (int k = 0; k < vset_iters; k++) {
+            ct_mont_mul(m1, batch_P[k], &(mont->RR), mont, top_w, ct_tmp);
+            ct_mont_mul(m1, m1, m1, mont, top_w, ct_tmp); 
+            ct_mont_mul(m1, m1, plain_one, mont, top_w, ct_tmp); 
+            ct_mod_add(m2, m1, D, w1, top_w, ct_tmp);
+
+            ct_bn_copy(temp_A, batch_inv[k], top_w);
+            
+            /* Algorithm CHVL Line 10: V_init <- 2(P^2 + D) * Inv[iter] mod n */
+            ct_mont_mul(m2, m2, &(mont->RR), mont, top_w, ct_tmp);
+            ct_mont_mul(temp_A, temp_A, &(mont->RR), mont, top_w, ct_tmp);
+            ct_mont_mul(temp_B, m2, temp_A, mont, top_w, ct_tmp);
+            ct_mont_mul(temp_B, temp_B, plain_one, mont, top_w, ct_tmp);
+            
+            ct_mod_add(temp_B, temp_B, temp_B, w1, top_w, ct_tmp); 
+
+            /* Algorithm CHVL Line 11: pass <- CV(V_init, e, n) (Trace Evaluation) */
+            ct_mont_mul(c_mont, temp_B, &(mont->RR), mont, top_w, ct_tmp); 
+            ct_bn_copy(R1_A, c_mont, top_w);
+            ct_bn_copy(R0_A, mont_two, top_w);                     
+
+            for (j = bit_len - 1; j >= 0; --j) {
+                int word_idx = j / BN_BITS2;
+                int bit_idx = j % BN_BITS2;
+                bit = (int)((e->d[word_idx] >> bit_idx) & 1);
+
+                ct_swap_arrays(bit, R0_A, R1_A, top_w);
+
+                ct_mont_mul(m1, R0_A, R1_A, mont, top_w, ct_tmp); 
+                ct_mod_sub(R1_A, m1, c_mont, w1, top_w, ct_tmp);
+
+                ct_mont_mul(m2, R0_A, R0_A, mont, top_w, ct_tmp); 
+                ct_mod_sub(R0_A, m2, mont_two, w1, top_w, ct_tmp);
+
+                ct_swap_arrays(bit, R0_A, R1_A, top_w);
+            }
+
+            ct_mont_mul(temp_A, R0_A, plain_one, mont, top_w, ct_tmp); 
+            ct_bn_copy(temp_B, plain_two, top_w);
+            
+            ct_mod_sub(m1, temp_A, temp_B, w1, top_w, ct_tmp);      
+            ct_mod_sub(m2, temp_A, w_minus_two, w1, top_w, ct_tmp); 
+            
+            int pass_this_round = ct_bn_is_zero(m1, top_w) | ct_bn_is_zero(m2, top_w);
+            
+            /* Algorithm CHVL Line 12: is_composite <- is_composite | ~pass */
+            is_composite |= (1 - pass_this_round);
+        }
+
+        OPENSSL_free(batch_P); 
+        OPENSSL_free(batch_m3); 
+        OPENSSL_free(batch_inv);
+    }
+
+    /* Algorithm CHVL Line 15: Return ~is_composite */
+    *status = is_composite ? BN_PRIMETEST_COMPOSITE : BN_PRIMETEST_PROBABLY_PRIME;
+    ret = 1;
+
+err:
+    BN_CTX_end(ctx);
+    BN_MONT_CTX_free(mont);
+    return ret;
+}
+
+/*
+ * Solovay-Strassen Probabilistic Primality Test
+ * Computes:
+ * 1. Jacobi symbol j = (a/w)
+ * 2. Euler criterion x = a^{(w-1)/2} mod w
+ * If x != j mod w, then w is composite.
+ */
+int ossl_bn_solovay_strassen_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx,
+                                      BN_GENCB *cb, int *status)
+{
+    int i, ret = 0, j_val;
+    BIGNUM *w1, *w_minus_2, *a, *x, *e;
+    BIGNUM *expected, *bn_w1_copy, *diff, *ct_tmp, *plain_one;
+    BN_MONT_CTX *mont = NULL;
+
+    if (!BN_is_odd(w)) return 0;
+    if (BN_cmp(w, BN_value_one()) <= 0) return 0;
+    if (BN_is_word(w, 3)) { 
+        *status = BN_PRIMETEST_PROBABLY_PRIME; 
+        return 1; 
+    }
+
+    BN_CTX_start(ctx);
+    
+    w1 = BN_CTX_get(ctx); w_minus_2 = BN_CTX_get(ctx);
+    a = BN_CTX_get(ctx); x = BN_CTX_get(ctx); e = BN_CTX_get(ctx);
+    expected = BN_CTX_get(ctx); bn_w1_copy = BN_CTX_get(ctx);
+    diff = BN_CTX_get(ctx); ct_tmp = BN_CTX_get(ctx);
+    plain_one = BN_CTX_get(ctx); 
+
+    if (plain_one == NULL) goto err;
+
+    if (!BN_copy(w1, w) || !BN_sub_word(w1, 1)) goto err;
+    BN_set_flags(w1, BN_FLG_CONSTTIME);
+    int top_w = w1->top;
+
+    BIGNUM *all_vars[] = {w1, w_minus_2, a, x, e, expected, bn_w1_copy, diff, ct_tmp, plain_one};
+    for (int k = 0; k < 10; k++) {
+        if (!bn_wexpand(all_vars[k], top_w)) goto err;
+        ct_pad_top(all_vars[k], top_w); 
+    }
+
+    if (!BN_copy(w_minus_2, w) || !BN_sub_word(w_minus_2, 2)) goto err;
+
+    /* Algorithm Line 1: e <- (n-1)/2 */
+    if (!BN_rshift1(e, w1)) goto err;
+    BN_set_flags(e, BN_FLG_CONSTTIME);
+    ct_pad_top(e, top_w); 
+
+    mont = BN_MONT_CTX_new();
+    if (mont == NULL || !BN_MONT_CTX_set(mont, w, ctx)) goto err;
+
+    BN_one(plain_one); 
+    ct_pad_top(plain_one, top_w);
+
+    /* Algorithm Line 2: is_composite <- false */
+    int is_composite = 0;
+    int w_bits_minus_1 = BN_num_bits(w) - 1; 
+
+    /* Algorithm Line 3: For i = 1 to k */
+    for (i = 0; i < iterations; ++i) {
+        /* Algorithm Line 4: a <-$ [2, n-2] */
+        if (!BN_priv_rand_ex(a, w_bits_minus_1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, 0, ctx)) goto err;
+        
+        ct_pad_top(a, top_w); 
+        ct_bn_add_word(a, 2, top_w); 
+
+        /* Algorithm Line 6: j_val <- (a/n) (Constant-time Jacobi) */
+        j_val = ossl_bn_jacobi_by(a, w, ctx);
+        
+        /* Algorithm Line 7: x <- a^e mod n (Evaluated via CT Montgomery Ladder) */
+        if (!ct_mod_exp_mont_ladder(x, a, e, mont, top_w, ctx, plain_one, ct_tmp)) goto err;
+
+        /* =========================================================
+         * Step 3: Constant-Time Euler Criterion Check
+         * ========================================================= */
+        int is_j_zero = (j_val == 0);
+        int is_j_minus_1 = (j_val == -1);
+
+        ct_bn_copy(expected, plain_one, top_w); 
+        
+        ct_bn_copy_padded(bn_w1_copy, w1, top_w);
+
+        /* Algorithm Line 9: expected <- CTSelect(j_val == -1, n-1, 1) */
+        ct_swap_arrays(is_j_minus_1, expected, bn_w1_copy, top_w);
+        ct_mod_sub(diff, x, expected, w, top_w, ct_tmp);
+
+        /* Algorithm Line 10: match <- (x == expected mod n) & (j_val != 0) */
+        int pass_this_round = ct_bn_is_zero(diff, top_w) & (1 - is_j_zero);
+        
+        /* Algorithm Line 11: is_composite <- is_composite | ~match */
+        is_composite |= (1 - pass_this_round);
+    }
+
+    /* Algorithm Line 13: Return ~is_composite */
+    *status = is_composite ? BN_PRIMETEST_COMPOSITE : BN_PRIMETEST_PROBABLY_PRIME;
+    ret = 1;
+
+err:
+    BN_CTX_end(ctx);
+    BN_MONT_CTX_free(mont);
+    return ret;
+}
+
+int ossl_bn_CHVSS_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx,
+                                    BN_GENCB *cb, int *status)
+{
+    int i, j, bit, bit_len, ret = 0;
+    
+    BIGNUM *w_ct, *w_minus_1, *w_minus_2;
+    BIGNUM *e_vset, *e_ss, *D, *D_mont, *P, *mont_one, *mont_two, *c_mont;
+    BIGNUM *R0_A, *R1_A, *x_ss, *expected_ss, *tmp_base, *bn_w1_copy;
+    BIGNUM *m1, *m2, *m3, *temp_A, *temp_B, *ct_tmp, *plain_one, *plain_two;
+    BN_MONT_CTX *mont = NULL;
+    
+    /* is_composite <- false */
+    int is_composite = 0;
+
+    if (!BN_is_odd(w)) return 0;
+    if (BN_cmp(w, BN_value_one()) <= 0) return 0;
+    if (BN_is_word(w, 3)) { 
+        *status = BN_PRIMETEST_PROBABLY_PRIME; 
+        return 1; 
+    }
+
+    BN_CTX_start(ctx);
+    
+    w_ct = BN_CTX_get(ctx); w_minus_1 = BN_CTX_get(ctx); w_minus_2 = BN_CTX_get(ctx);
+    e_vset = BN_CTX_get(ctx); e_ss = BN_CTX_get(ctx);
+    D = BN_CTX_get(ctx); D_mont = BN_CTX_get(ctx); P = BN_CTX_get(ctx); 
+    mont_one = BN_CTX_get(ctx); mont_two = BN_CTX_get(ctx); c_mont = BN_CTX_get(ctx);
+    R0_A = BN_CTX_get(ctx); R1_A = BN_CTX_get(ctx); 
+    x_ss = BN_CTX_get(ctx); expected_ss = BN_CTX_get(ctx); tmp_base = BN_CTX_get(ctx);
+    bn_w1_copy = BN_CTX_get(ctx);
+    m1 = BN_CTX_get(ctx); m2 = BN_CTX_get(ctx); m3 = BN_CTX_get(ctx); 
+    temp_A = BN_CTX_get(ctx); temp_B = BN_CTX_get(ctx); ct_tmp = BN_CTX_get(ctx); 
+    plain_one = BN_CTX_get(ctx); plain_two = BN_CTX_get(ctx);
+
+    if (plain_two == NULL) goto err;
+
+    if (!BN_copy(w_ct, w)) goto err;
+    BN_set_flags(w_ct, BN_FLG_CONSTTIME);
+    int top_w = w_ct->top;
+
+    if (!BN_copy(w_minus_1, w) || !BN_sub_word(w_minus_1, 1)) goto err;
+    BN_set_flags(w_minus_1, BN_FLG_CONSTTIME);
+
+    if (!BN_copy(w_minus_2, w) || !BN_sub_word(w_minus_2, 2)) goto err;
+    BN_set_flags(w_minus_2, BN_FLG_CONSTTIME);
+
+    BIGNUM *vars[] = {w_ct, w_minus_1, w_minus_2, e_vset, e_ss, D, D_mont, P, mont_one, mont_two, c_mont,
+                      R0_A, R1_A, x_ss, expected_ss, tmp_base, bn_w1_copy,
+                      m1, m2, m3, temp_A, temp_B, ct_tmp, plain_one, plain_two};
+    for (i = 0; i < 25; i++) {
+        if (!bn_wexpand(vars[i], top_w)) goto err;
+        ct_pad_top(vars[i], top_w);
+    }
+
+    mont = BN_MONT_CTX_new();
+    if (mont == NULL || !BN_MONT_CTX_set(mont, w_ct, ctx)) goto err;
+
+    BN_one(plain_one); ct_pad_top(plain_one, top_w);
+    BN_set_word(plain_two, 2); ct_pad_top(plain_two, top_w);
+    BN_set_word(temp_A, 2); ct_pad_top(temp_A, top_w);
+
+    /* D <- 0, found_D <- false */
+    int found_D_mask = 0;
+    
+    /* is_3_mod_4 <- (n & 3) == 3 */
+    int is_3_mod_4 = BN_is_bit_set(w_ct, 1);
+    
+    BN_zero(D); ct_pad_top(D, top_w);
+
+    ct_bn_copy_padded(e_ss, w_minus_1, top_w); 
+    ct_bn_rshift1(e_ss, top_w);
+
+    /* J_target <- CTSelect(is_3_mod_4, 1, -1) */
+    int target_j_val = is_3_mod_4 ? 1 : -1;
+    
+    /* iterations I_SS */
+    int constSS = 8;
+    int w_bits_minus_1 = BN_num_bits(w_ct) - 1; 
+    
+    /* ====================================================================
+     * Phase 1A: Amortized SS Test & CT D Search
+     * ==================================================================== */
+    for (i = 0; i < constSS; i++) {
+        /* a <-$ [2, n-2] */
+        if (!BN_priv_rand_ex(tmp_base, w_bits_minus_1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, 0, ctx)) goto err;
+        ct_pad_top(tmp_base, top_w);
+        ct_bn_add_word(tmp_base, 2, top_w); 
+
+        /* J <- (a/n) (Constant-time Jacobi) */
+        int j_val = ossl_bn_jacobi_by(tmp_base, w_ct, ctx); 
+        
+        /* x <- a^{(n-1)/2} mod n (Evaluated via CT Montgomery Ladder) */
+        if (!ct_mod_exp_mont_ladder(x_ss, tmp_base, e_ss, mont, top_w, ctx, plain_one, ct_tmp)) goto err; 
+        
+        /* Conditionally update D without branching */
+        /* is_match <- (J == J_target) */
+        int is_match = (j_val == target_j_val);
+        /* update_D <- is_match & ~found_D */
+        int update_D = is_match & (!found_D_mask);
+        /* D <- CTSelect(update_D, a, D) */
+        ct_swap_arrays(update_D, D, tmp_base, top_w);
+        /* found_D <- found_D | update_D */
+        found_D_mask |= update_D; 
+
+        /* Verify SS condition: fail_SS <- (J == 0) | (x != J mod n) */
+        int is_j_zero = (j_val == 0);
+        int is_j_minus_1 = (j_val == -1); 
+
+        BN_one(expected_ss); ct_pad_top(expected_ss, top_w);
+        ct_bn_copy_padded(bn_w1_copy, w_minus_1, top_w);
+
+        ct_swap_arrays(is_j_minus_1, expected_ss, bn_w1_copy, top_w);
+        ct_mod_sub(m1, x_ss, expected_ss, w_ct, top_w, ct_tmp); 
+
+        /* is_composite <- is_composite | fail_SS */
+        int pass_this_round = ct_bn_is_zero(m1, top_w) & (1 - is_j_zero);
+        is_composite |= (1 - pass_this_round);
+    }
+
+    /* ====================================================================
+     * Phase 1B: Deterministic Fallback Search (Always Executed)
+     * ==================================================================== */
+    /* L <- {3, 5, 7, ..., p_{I_fb}} (Array of I_fb small primes) */
+    int totalSmallPrimeTry = 25 - constSS;
+    static const int small_primes[25] = {3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101};
+    
+    for (i = 0; i < totalSmallPrimeTry; i++) {
+        BN_set_word(tmp_base, small_primes[i]);
+        ct_pad_top(tmp_base, top_w);
+
+        /* J <- (p/n) */
+        int j_val = ossl_bn_jacobi_by(tmp_base, w_ct, ctx); 
+        
+        /* Conditionally update D without branching */
+        int is_match = (j_val == target_j_val);
+        int update_D = is_match & (!found_D_mask);
+        ct_swap_arrays(update_D, D, tmp_base, top_w);
+        found_D_mask |= update_D; 
+    }
+
+    /* is_composite <- is_composite | ~found_D (Structurally reject squares) */
+    is_composite |= (1 - found_D_mask);
+
+    /* ====================================================================
+     * Phase 2: Amortized Setup & CT Ladder for vTraceLucas
+     * ==================================================================== */
+    ct_bn_copy_padded(e_vset, w_ct, top_w);
+    
+    /* modifier <- CTSelect(is_3_mod_4, -1, 1) */
+    BN_ULONG add_val = is_3_mod_4 ? 0 : 1;
+    BN_ULONG sub_val = is_3_mod_4 ? 1 : 0;
+    
+    BN_ULONG c = add_val;
+    for (int k = 0; k < top_w; k++) {
+        BN_ULONG sum = e_vset->d[k] + c;
+        c = (sum < e_vset->d[k]) ? 1 : 0;
+        e_vset->d[k] = sum;
+    }
+    c = sub_val;
+    for (int k = 0; k < top_w; k++) {
+        BN_ULONG diff = e_vset->d[k] - c;
+        c = (e_vset->d[k] < c) ? 1 : 0;
+        e_vset->d[k] = diff;
+    }
+    
+    /* e <- (n + modifier) / 2 */
+    ct_bn_rshift1(e_vset, top_w);
+    bit_len = BN_num_bits(w_ct) - 1; 
+
+    ct_mont_mul(D_mont, D, &(mont->RR), mont, top_w, ct_tmp);
+    ct_mont_mul(mont_one, plain_one, &(mont->RR), mont, top_w, ct_tmp);
+    ct_mont_mul(mont_two, temp_A, &(mont->RR), mont, top_w, ct_tmp);
+
+    /* iterations I_Vset */
+    int vset_iters = iterations - constSS;
+    if (vset_iters < 0) vset_iters = 0;
+
+    if (vset_iters > 0) {
+        BIGNUM **batch_P = OPENSSL_malloc(vset_iters * sizeof(BIGNUM *));
+        BIGNUM **batch_m3 = OPENSSL_malloc(vset_iters * sizeof(BIGNUM *));
+        BIGNUM **batch_inv = OPENSSL_malloc(vset_iters * sizeof(BIGNUM *));
+
+        if (batch_P == NULL || batch_m3 == NULL || batch_inv == NULL) {
+            if (batch_P) OPENSSL_free(batch_P);
+            if (batch_m3) OPENSSL_free(batch_m3);
+            if (batch_inv) OPENSSL_free(batch_inv);
+            goto err;
+        }
+
+        for (int k = 0; k < vset_iters; k++) {
+            batch_P[k] = BN_CTX_get(ctx);
+            batch_m3[k] = BN_CTX_get(ctx);
+            batch_inv[k] = BN_CTX_get(ctx);
+            if (batch_P[k] == NULL || batch_m3[k] == NULL || batch_inv[k] == NULL) goto err;
+            bn_wexpand(batch_P[k], top_w); ct_pad_top(batch_P[k], top_w);
+            bn_wexpand(batch_m3[k], top_w); ct_pad_top(batch_m3[k], top_w);
+            bn_wexpand(batch_inv[k], top_w); ct_pad_top(batch_inv[k], top_w);
+        }
+
+        /* --- Crucial Optimization: Batch invert for all Trace iterations --- */
+        
+        /* Step A: P <- Sample_Array(I_Vset, [1, n-1]) */
+        for (int k = 0; k < vset_iters; k++) {
+            if (!BN_priv_rand_ex(batch_P[k], w_bits_minus_1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, 0, ctx)) goto err;
+            ct_pad_top(batch_P[k], top_w); 
+            ct_bn_add_word(batch_P[k], 1, top_w); 
+
+            ct_mont_mul(m1, batch_P[k], &(mont->RR), mont, top_w, ct_tmp);
+            ct_mont_mul(m1, m1, m1, mont, top_w, ct_tmp); 
+            ct_mont_mul(m1, m1, plain_one, mont, top_w, ct_tmp); 
+
+            /* Prepare array: {P^2 - D | P \in P} */
+            ct_mod_sub(batch_m3[k], m1, D, w_ct, top_w, ct_tmp);          
+        }
+
+        /* Step B: (Inv, Coprime_Flags) <- CT_Batch_Invert(...) */
+        if (!ct_batch_invert_mont(batch_inv, batch_m3, vset_iters, w_ct, top_w, ctx, mont, plain_one, ct_tmp, &is_composite)) {
+            goto err;
+        }
+
+        /* Step C: Evaluate V_init and CV sequence for all I_Vset iterations */
+        for (int k = 0; k < vset_iters; k++) {
+            ct_mont_mul(m1, batch_P[k], &(mont->RR), mont, top_w, ct_tmp);
+            ct_mont_mul(m1, m1, m1, mont, top_w, ct_tmp); 
+            ct_mont_mul(m1, m1, plain_one, mont, top_w, ct_tmp); 
+            ct_mod_add(m2, m1, D, w_ct, top_w, ct_tmp);
+
+            ct_bn_copy(temp_A, batch_inv[k], top_w);
+            
+            /* V_init <- 2(P^2 + D) * Inv[iter] mod n */
+            ct_mont_mul(m2, m2, &(mont->RR), mont, top_w, ct_tmp);
+            ct_mont_mul(temp_A, temp_A, &(mont->RR), mont, top_w, ct_tmp);
+            ct_mont_mul(temp_B, m2, temp_A, mont, top_w, ct_tmp);
+            ct_mont_mul(temp_B, temp_B, plain_one, mont, top_w, ct_tmp);
+            
+            ct_mod_add(temp_B, temp_B, temp_B, w_ct, top_w, ct_tmp); 
+
+            ct_mont_mul(c_mont, temp_B, &(mont->RR), mont, top_w, ct_tmp); 
+            ct_bn_copy(R1_A, c_mont, top_w);                       
+            ct_bn_copy(R0_A, mont_two, top_w);                     
+
+            /* Evaluate CV(V_init, e, n) via CT Ladder */
+            for (j = bit_len - 1; j >= 0; --j) {
+                int word_idx = j / BN_BITS2;
+                int bit_idx = j % BN_BITS2;
+                bit = (int)((e_vset->d[word_idx] >> bit_idx) & 1);
+
+                ct_swap_arrays(bit, R0_A, R1_A, top_w);
+
+                ct_mont_mul(m1, R0_A, R1_A, mont, top_w, ct_tmp); 
+                ct_mod_sub(R1_A, m1, c_mont, w_ct, top_w, ct_tmp);
+
+                ct_mont_mul(m2, R0_A, R0_A, mont, top_w, ct_tmp); 
+                ct_mod_sub(R0_A, m2, mont_two, w_ct, top_w, ct_tmp);
+
+                ct_swap_arrays(bit, R0_A, R1_A, top_w);
+            }
+
+            ct_mont_mul(temp_A, R0_A, plain_one, mont, top_w, ct_tmp); 
+            
+            ct_bn_copy(temp_B, plain_two, top_w);
+            
+            /* pass <- (V_e == 2) || (V_e == n - 2) */
+            ct_mod_sub(m1, temp_A, temp_B, w_ct, top_w, ct_tmp);      
+            ct_mod_sub(m2, temp_A, w_minus_2, w_ct, top_w, ct_tmp); 
+            
+            int pass_this_round = ct_bn_is_zero(m1, top_w) | ct_bn_is_zero(m2, top_w);
+            
+            /* is_composite <- is_composite | ~pass */
+            is_composite |= (1 - pass_this_round);
+        }
+
+        OPENSSL_free(batch_P); 
+        OPENSSL_free(batch_m3); 
+        OPENSSL_free(batch_inv);
+    }
+
+    /* Return ~is_composite */
+    *status = is_composite ? BN_PRIMETEST_COMPOSITE : BN_PRIMETEST_PROBABLY_PRIME;
+    ret = 1;
+
+err:
+    BN_CTX_end(ctx);
+    BN_MONT_CTX_free(mont);
+    return ret;
+}
+
+int ossl_bn_miller_rabin_is_prime_unified(const BIGNUM *w, int iterations, BN_CTX *ctx,
+                                          BN_GENCB *cb, int *status)
+{
+    int i, j, ret = 0;
+    BIGNUM *w1, *w3, *b, *R0, *R1, *t1;
+    BIGNUM *mont_one, *mont_w1, *ct_tmp, *plain_one; 
+    BN_MONT_CTX *mont = NULL;
+
+    if (!BN_is_odd(w)) return 0;
+    if (BN_cmp(w, BN_value_one()) <= 0) return 0;
+    if (BN_is_word(w, 3)) { *status = BN_PRIMETEST_PROBABLY_PRIME; return 1; }
+
+    BN_CTX_start(ctx);
+    w1 = BN_CTX_get(ctx); w3 = BN_CTX_get(ctx); b = BN_CTX_get(ctx);
+    R0 = BN_CTX_get(ctx); R1 = BN_CTX_get(ctx); t1 = BN_CTX_get(ctx);
+    mont_one = BN_CTX_get(ctx); mont_w1 = BN_CTX_get(ctx);
+    ct_tmp = BN_CTX_get(ctx); plain_one = BN_CTX_get(ctx);
+
+    if (plain_one == NULL) goto err;
+
+    if (!BN_copy(w1, w) || !BN_sub_word(w1, 1)) goto err;
+    BN_set_flags(w1, BN_FLG_CONSTTIME);
+    int top_w = w1->top;
+    
+    /* Algorithm Line 1: L <- bit length of n-1 */
+    int bit_len = BN_num_bits(w1);
+    int w_bits_minus_1 = BN_num_bits(w) - 1; 
+
+    if (!BN_copy(w3, w) || !BN_sub_word(w3, 3)) goto err;
+
+    /* Array size reduced from 11 to 10 */
+    BIGNUM *all_vars[] = {w1, w3, b, R0, R1, t1, mont_one, mont_w1, ct_tmp, plain_one};
+    for (int k = 0; k < 10; k++) {
+        if (!bn_wexpand(all_vars[k], top_w)) goto err;
+        ct_pad_top(all_vars[k], top_w); 
+    }
+
+    BN_one(plain_one); ct_pad_top(plain_one, top_w); 
+    
+    /* Algorithm Line 2: s <- count trailing zeros of n-1 (Constant-Time Implementation) */
+    int s = 0;
+    int found_one = 0;
+    for (int k = 0; k < bit_len; k++) {
+        int word_idx = k / BN_BITS2;
+        int bit_idx = k % BN_BITS2;
+        int bit_val = (int)((w1->d[word_idx] >> bit_idx) & 1);
+        found_one |= bit_val;
+        s += (1 - found_one);
+    }
+
+    mont = BN_MONT_CTX_new();
+    if (mont == NULL || !BN_MONT_CTX_set(mont, w, ctx)) goto err;
+    ct_mont_mul(mont_one, plain_one, &(mont->RR), mont, top_w, ct_tmp);
+    ct_mont_mul(mont_w1, w1, &(mont->RR), mont, top_w, ct_tmp);
+
+    if (iterations == 0) iterations = bn_mr_min_checks(BN_num_bits(w));
+
+    /* Algorithm Line 3: is_composite <- false */
+    int is_composite = 0;
+
+    /* Algorithm Line 4: For i = 1 to k */
+    for (i = 0; i < iterations; ++i) {
+        /* Algorithm Line 5: a <-$ [2, n-2] */
+        if (!BN_priv_rand_ex(b, w_bits_minus_1, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, 0, ctx)) goto err;
+        ct_pad_top(b, top_w);
+        ct_bn_add_word(b, 2, top_w);
+
+        /* Algorithm Line 6: R_0 <- 1, R_1 <- a mod n (in Montgomery domain) */
+        ct_bn_copy(R0, mont_one, top_w); 
+        ct_mont_mul(R1, b, &(mont->RR), mont, top_w, ct_tmp); 
+
+        /* Algorithm Line 7: pass_round <- false */
+        int pass_this_round = 0;
+
+        /* Algorithm Lines 8-9: Fixed-length Montgomery Ladder (For j = L-1 to 0) */
+        for (j = bit_len - 1; j >= 0; --j) {
+            /* Algorithm Line 10: bit <- bit j of n-1 */
+            int word_idx = j / BN_BITS2;
+            int bit_idx = j % BN_BITS2;
+            int bit_val = (int)((w1->d[word_idx] >> bit_idx) & 1);
+
+            /* Algorithm Line 11: CSWAP(bit, R_0, R_1) */
+            ct_swap_arrays(bit_val, R0, R1, top_w);
+
+            /* Algorithm Line 12: R_1 <- R_0 * R_1 mod n */
+            ct_mont_mul(t1, R0, R1, mont, top_w, ct_tmp);
+            
+            /* Algorithm Line 13: R_0 <- R_0 * R_0 mod n */
+            ct_mont_mul(R0, R0, R0, mont, top_w, ct_tmp);
+            
+            ct_bn_copy(R1, t1, top_w);
+            
+            /* Algorithm Line 14: CSWAP(bit, R_0, R_1) */
+            ct_swap_arrays(bit_val, R0, R1, top_w);
+
+            /* Algorithm Lines 16-18: Capture MR conditions via bitwise logic */
+            int is_one = ct_bn_equal(R0, mont_one, top_w);
+            int is_w_minus_1 = ct_bn_equal(R0, mont_w1, top_w);
+
+            int is_at_s = ct_eq_int(j, s);
+            int is_in_range = ct_ge_int(s, j) & ct_ge_int(j, 1);
+
+            /* Algorithm Line 19: pass_round <- pass_round | ((j == s) & is_one) */
+            pass_this_round |= (is_at_s & is_one);
+            
+            /* Algorithm Line 20: pass_round <- pass_round | ((1 <= j <= s) & is_minus_one) */
+            pass_this_round |= (is_in_range & is_w_minus_1);
+        }
+
+        /* Algorithm Line 22: is_composite <- is_composite | ~pass_round */
+        is_composite |= (1 - pass_this_round);
+    }
+
+    /* Algorithm Line 24: Return ~is_composite */
+    *status = is_composite ? BN_PRIMETEST_COMPOSITE : BN_PRIMETEST_PROBABLY_PRIME;
+    ret = 1;
+
+err:
+    BN_CTX_end(ctx); BN_MONT_CTX_free(mont);
+    return ret;
+}

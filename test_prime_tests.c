@@ -4,44 +4,44 @@
 #include <openssl/rand.h>
 #include <sys/time.h>
 
-/* --- 補齊 OpenSSL 內部常數 --- */
+/* --- Supplement OpenSSL Internal Constants --- */
 #define BN_PRIMETEST_COMPOSITE                    0
 #define BN_PRIMETEST_COMPOSITE_WITH_FACTOR        1
 #define BN_PRIMETEST_COMPOSITE_NOT_POWER_OF_PRIME 2
 #define BN_PRIMETEST_PROBABLY_PRIME               3
 /* --------------------------------------------- */
 
-/* * 宣告 OpenSSL 內部的質數測試函數 */
-extern int ossl_bn_lucas_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
+/* Declare OpenSSL Internal Primality Testing Functions */
+extern int ossl_bn_CHVL_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 extern int ossl_bn_miller_rabin_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int enhanced, int *status);
 extern int ossl_bn_solovay_strassen_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 
-/* 🔥 宣告您新寫的 Fully-Padded Constant-Time Miller-Rabin */
+/* 🔥 Declare the newly written Fully-Padded Constant-Time Miller-Rabin */
 extern int ossl_bn_miller_rabin_is_prime_unified(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 
-/* 🔥🔥 宣告您最新的 CCS 2026 混合動力版 (Amortized SS + Vset) */
-extern int ossl_bn_ss_vset_hybrid_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
+/* 🔥🔥 Declare the latest CCS 2026 Hybrid Version (Amortized SS + Vset) */
+extern int ossl_bn_CHVSS_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 
-/* 🔥🔥🔥 宣告 OpenSSL 內建的與您新寫的 Constant-Time Jacobi */
+/* 🔥🔥🔥 Declare OpenSSL built-in and the newly written Constant-Time Jacobi */
 extern int BN_kronecker(const BIGNUM *a, const BIGNUM *b, BN_CTX *ctx);
 extern int ossl_bn_jacobi_by(const BIGNUM *x_in, const BIGNUM *y_in, BN_CTX *ctx);
 
-/* 🔥🔥🔥 宣告您的 Constant-Time Binary GCD (提取自 Lucas Test) */
+/* 🔥🔥🔥 Declare the Constant-Time Binary GCD (Extracted from Lucas Test) */
 extern void ct_by_invert(BIGNUM *out, const BIGNUM *x, const BIGNUM *m, int top_w, BN_CTX *ctx);
 extern void ct_by_gcd_inv(BIGNUM *out_inv, BIGNUM *out_gcd, const BIGNUM *x, const BIGNUM *m, int top_w, BN_CTX *ctx);
 
 
-/* 🛠️ 補齊缺失的 OpenSSL 內部函數宣告 (用來操作 BIGNUM 記憶體) */
+/* 🛠️ Supplement missing OpenSSL internal function declarations (for BIGNUM memory manipulation) */
 extern BIGNUM *bn_wexpand(BIGNUM *a, int words);
 extern void bn_correct_top(BIGNUM *a);
 
 
-/* 時間計算輔助函數 */
+/* Time Calculation Auxiliary Function */
 long long timeval_diff(struct timeval *start, struct timeval *end) {
     return (end->tv_sec - start->tv_sec) * 1000000LL + (end->tv_usec - start->tv_usec);
 }
 
-/* 測試一：正確性比對 (MR vs MR-FP vs Lucas vs SS vs Hybrid) */
+/* Test 1: Functional Equivalence Test (MR vs MR-FP vs Lucas vs SS vs Hybrid) */
 void run_correctness_test(int num_tests, int bits) {
     BN_CTX *ctx = BN_CTX_new();
     BIGNUM *w = BN_new();
@@ -52,25 +52,25 @@ void run_correctness_test(int num_tests, int bits) {
     printf("1. Starting functional equivalence test (%d rounds, %d-bit)...\n", num_tests, bits);
 
     for (int i = 0; i < num_tests; i++) {
-        /* 隨機生成一個奇數 */
+        /* Generate a random odd number */
         BN_rand(w, bits, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ODD);
 
-        /* 呼叫原本的 Miller-Rabin (跑 64 圈) */
+        /* Call original Miller-Rabin (64 iterations) */
         ossl_bn_miller_rabin_is_prime(w, 64, ctx, NULL, 0, &status_mr);
         
-        /* 呼叫 Fully-Padded CT Miller-Rabin (跑 64 圈) */
+        /* Call Fully-Padded CT Miller-Rabin (64 iterations) */
         ossl_bn_miller_rabin_is_prime_unified(w, 64, ctx, NULL, &status_mr_fp);
 
-        /* 呼叫你的原始 Lucas 測試 (跑 64 圈) */
-        ossl_bn_lucas_is_prime(w, 64, ctx, NULL, &status_lucas);
+        /* Call the CHVL Lucas test (64 iterations) */
+        ossl_bn_CHVL_is_prime(w, 64, ctx, NULL, &status_lucas);
 
-        /* 呼叫 Solovay-Strassen 測試 (跑 64 圈) */
+        /* Call Solovay-Strassen test (64 iterations) */
         ossl_bn_solovay_strassen_is_prime(w, 64, ctx, NULL, &status_ss);
 
-        /* 呼叫最新的 Hybrid SS+Vset 測試 (跑 68 圈: 8 SS + 60 Vset) */
-        ossl_bn_ss_vset_hybrid_is_prime(w, 68, ctx, NULL, &status_hybrid);
+        /* Call the latest Hybrid SS+Vset test (68 iterations: 8 SS + 60 Vset) */
+        ossl_bn_CHVSS_is_prime(w, 68, ctx, NULL, &status_hybrid);
 
-        /* 驗證五者結果是否一致 */
+        /* Verify if all five results match perfectly */
         int is_prime_mr      = (status_mr == BN_PRIMETEST_PROBABLY_PRIME);
         int is_prime_mr_fp   = (status_mr_fp == BN_PRIMETEST_PROBABLY_PRIME);
         int is_prime_lucas   = (status_lucas == BN_PRIMETEST_PROBABLY_PRIME);
@@ -101,7 +101,7 @@ void run_correctness_test(int num_tests, int bits) {
     BN_CTX_free(ctx);
 }
 
-/* 測試二：效能基準測試 */
+/* Test 2: Performance Benchmark Test */
 void run_performance_benchmark(int num_tests, int bits) {
     BN_CTX *ctx = BN_CTX_new();
     BIGNUM *w = BN_new();
@@ -136,7 +136,7 @@ void run_performance_benchmark(int num_tests, int bits) {
 
     gettimeofday(&start, NULL);
     for (int i = 0; i < num_tests; i++) {
-        ossl_bn_lucas_is_prime(w, 66, ctx, NULL, &status);
+        ossl_bn_CHVL_is_prime(w, 66, ctx, NULL, &status);
     }
     gettimeofday(&end, NULL);
     time_lucas = timeval_diff(&start, &end);
@@ -150,7 +150,7 @@ void run_performance_benchmark(int num_tests, int bits) {
 
     gettimeofday(&start, NULL);
     for (int i = 0; i < num_tests; i++) {
-        ossl_bn_ss_vset_hybrid_is_prime(w, 69, ctx, NULL, &status);
+        ossl_bn_CHVSS_is_prime(w, 69, ctx, NULL, &status);
     }
     gettimeofday(&end, NULL);
     time_hybrid = timeval_diff(&start, &end);
@@ -174,7 +174,7 @@ void run_performance_benchmark(int num_tests, int bits) {
     BN_CTX_free(ctx);
 }
 
-/* 測試三：Jacobi 正確性比對 (OpenSSL vs CT BY) */
+/* Test 3: Jacobi Correctness Comparison (OpenSSL vs CT BY) */
 void run_correctness_jacobi_test(int num_tests, int bits) {
     BN_CTX *ctx = BN_CTX_new();
     BIGNUM *x = BN_new();
@@ -217,7 +217,7 @@ void run_correctness_jacobi_test(int num_tests, int bits) {
     BN_CTX_free(ctx);
 }
 
-/* 測試四：GCD/Inversion 正確性比對 (OpenSSL vs CT Binary GCD) */
+/* Test 4: GCD/Inversion Correctness Comparison (OpenSSL vs CT Binary GCD) */
 void run_correctness_gcd_test(int num_tests, int bits) {
     BN_CTX *ctx = BN_CTX_new();
     BIGNUM *a = BN_new();
@@ -232,31 +232,31 @@ void run_correctness_gcd_test(int num_tests, int bits) {
     printf("4. Starting GCD/Inversion equivalence test (%d rounds, %d-bit)...\n", num_tests, bits);
 
     for (int i = 0; i < num_tests; i++) {
-        /* 生成兩個位元數相同的隨機數 (b 保證為奇數) */
+        /* Generate two random numbers of the same bit length (b is guaranteed odd) */
         BN_rand(a, bits, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY);
         BN_rand(b, bits, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ODD);
 
-        /* 1. 使用 OpenSSL 內建函式求 GCD */
+        /* 1. Calculate GCD using OpenSSL built-in function */
         BN_gcd(gcd_ref, a, b, ctx);
 
-        /* 2. 使用你的常數時間 Binary GCD 演算法
-         * 注意：我們需要把 a 和 b 撐到相同的 top_w，才能餵給 ct_by_invert */
+        /* 2. Use the Constant-Time Binary GCD algorithm.
+         * Note: We need to expand a and b to the same top_w before feeding to ct_by_invert */
         int top_w = (bits + BN_BITS2 - 1) / BN_BITS2;
         
-        /* 🚀 修正 Segfault：預先分配所有的內部陣列到需要的長度！ */
+        /* 🚀 Fix Segfault: Pre-allocate all internal arrays to the required length! */
         bn_wexpand(a, top_w);
         bn_wexpand(b, top_w);
         bn_wexpand(gcd_ct, top_w); 
         bn_wexpand(inv_ct, top_w);
         
-        /* ct_by_invert 執行完會把結果蓋進 gcd_ct 預留好的陣列中 */
+        /* ct_by_invert will write the result into the pre-allocated gcd_ct array */
         ct_by_gcd_inv(inv_ct, gcd_ct, a, b, top_w, ctx);
 
-        /* 為了比較，我們需要將回傳的 gcd_ct 去除前導零 (normalize) */
+        /* For comparison, we need to remove leading zeros from the returned gcd_ct (normalize) */
         bn_correct_top(gcd_ct);
         bn_correct_top(inv_ct);
 
-        /* 3. 比較結果 */
+        /* 3. Compare results */
         if (BN_cmp(gcd_ref, gcd_ct) != 0) {
             printf("[FAILED] GCD Mismatch found!\n");
             char *a_str = BN_bn2hex(a);
@@ -272,7 +272,7 @@ void run_correctness_gcd_test(int num_tests, int bits) {
             exit(1);
         }
 
-        /* 4. 加碼比對反元素是否正確 */
+        /* 4. Additionally compare if the modular inverse is correct */
         if (BN_is_one(gcd_ref)) {
             BN_mod_inverse(inv_ref, a, b, ctx); 
             if (BN_cmp(inv_ref, inv_ct) != 0) {
@@ -295,20 +295,20 @@ void run_correctness_gcd_test(int num_tests, int bits) {
     BN_CTX_free(ctx);
 }
 
-/* 主程式：負責啟動所有測試 */
+/* Main Program: Triggers all tests */
 int main(int argc, char **argv) {
     
-    /* 執行正確性對比：測 500 次 512-bit 隨機數字 */
+    /* Execute correctness comparison: 500 iterations of 512-bit random numbers */
     run_correctness_test(500, 512);
 
-    /* 🔥 新增：執行 Jacobi 正確性對比測試 */
+    /* 🔥 Added: Execute Jacobi correctness comparison test */
     run_correctness_jacobi_test(5000, 2048);
     
-    /* 🔥 新增：執行 GCD/Inversion 正確性對比測試 */
+    /* 🔥 Added: Execute GCD/Inversion correctness comparison test */
     run_correctness_gcd_test(10000, 512);
 
-    /* 執行效能測試：測 600 次 512-bit 質數 */
-    /* 備註：在論文中建議改為 2048-bit 測 100 次，以展現大數乘法的真實威力 */
+    /* Execute performance benchmark test */
+    /* Note: For the paper, it is recommended to test 2048-bit 100 times to demonstrate the true power of large number multiplication */
     run_performance_benchmark(5000, 2048);
 
     run_performance_benchmark(5000, 1536);
