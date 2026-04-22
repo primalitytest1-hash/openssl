@@ -61,13 +61,13 @@ void run_correctness_test(int num_tests, int bits) {
         /* Call Fully-Padded CT Miller-Rabin (64 iterations) */
         ossl_bn_miller_rabin_is_prime_unified(w, 64, ctx, NULL, &status_mr_fp);
 
-        /* Call the CHVL Lucas test (64 iterations) */
-        ossl_bn_CHVL_is_prime(w, 64, ctx, NULL, &status_lucas);
+        /* Call the CHVL Lucas test (66 iterations) */
+        ossl_bn_CHVL_is_prime(w, 66, ctx, NULL, &status_lucas);
 
-        /* Call Solovay-Strassen test (64 iterations) */
-        ossl_bn_solovay_strassen_is_prime(w, 64, ctx, NULL, &status_ss);
+        /* Call Solovay-Strassen test (128 iterations) */
+        ossl_bn_solovay_strassen_is_prime(w, 128, ctx, NULL, &status_ss);
 
-        /* Call the latest Hybrid SS+Vset test (68 iterations: 8 SS + 60 Vset) */
+        /* Call the latest Hybrid SS+Vset test (68 iterations: 7 SS + 61 Vset) */
         ossl_bn_CHVSS_is_prime(w, 68, ctx, NULL, &status_hybrid);
 
         /* Verify if all five results match perfectly */
@@ -114,8 +114,8 @@ void run_performance_benchmark(int num_tests, int bits) {
     printf("   (Aligned to 2^-128 security level)\n");
     printf("   - MR (Baseline)    : 64 iters\n");
     printf("   - SS (Pure)        : 128 iters\n");
-    printf("   - Proposed Lucas   : 66 iters\n");
-    printf("   - Amortized Hybrid : 69 iters (8 SS + 61 Vset)\n");
+    printf("   - CHVL   : 66 iters\n");
+    printf("   - CHVSS : 68 iters (7 SS + 61 Vset)\n");
     printf("--------------------------------------------------\n");
 
     BN_generate_prime_ex(w, bits, 0, NULL, NULL, NULL);
@@ -150,7 +150,7 @@ void run_performance_benchmark(int num_tests, int bits) {
 
     gettimeofday(&start, NULL);
     for (int i = 0; i < num_tests; i++) {
-        ossl_bn_CHVSS_is_prime(w, 69, ctx, NULL, &status);
+        ossl_bn_CHVSS_is_prime(w, 68, ctx, NULL, &status);
     }
     gettimeofday(&end, NULL);
     time_hybrid = timeval_diff(&start, &end);
@@ -159,15 +159,15 @@ void run_performance_benchmark(int num_tests, int bits) {
     printf("Miller-Rabin (Raw): %lld us\n", time_mr);
     printf("Miller-Rabin (FP) : %lld us\n", time_mr_fp);
     printf("Solovay-Strass.   : %lld us\n", time_ss);
-    printf("Lucas Ladder Time : %lld us\n", time_lucas);
-    printf("Hybrid SS+Vset    : %lld us  <-- YOUR PAPER'S HERO\n", time_hybrid);
+    printf("CHVL Time : %lld us\n", time_lucas);
+    printf("CHVSS Time  : %lld us\n", time_hybrid);
     
     printf("\n--- Performance Overheads (Normalized to Raw MR) ---\n");
     printf("MR (Baseline)     : 1.00x\n");
     printf("MR (Unified FP)   : %.2fx\n", (double)time_mr_fp / time_mr);
     printf("Solovay-Strassen  : %.2fx\n", (double)time_ss / time_mr);
-    printf("Proposed Lucas    : %.2fx\n", (double)time_lucas / time_mr);
-    printf("Amortized Hybrid  : %.2fx\n", (double)time_hybrid / time_mr);
+    printf("CHVL    : %.2fx\n", (double)time_lucas / time_mr);
+    printf("CHVSS  : %.2fx\n", (double)time_hybrid / time_mr);
     printf("==================================================\n");
 
     BN_free(w);
@@ -309,11 +309,11 @@ int main(int argc, char **argv) {
 
     /* Execute performance benchmark test */
     /* Note: For the paper, it is recommended to test 2048-bit 100 times to demonstrate the true power of large number multiplication */
-    run_performance_benchmark(5000, 2048);
+    run_performance_benchmark(6000, 2048);
 
-    run_performance_benchmark(5000, 1536);
+    run_performance_benchmark(6000, 1536);
 
-    run_performance_benchmark(5000, 1024);
+    run_performance_benchmark(6000, 1024);
     
     return 0;
 }
