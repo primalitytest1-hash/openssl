@@ -1,12 +1,12 @@
-# Artifact Evaluation: High-Efficiency Natively Branchless Primality Testing against Structural Leakage
+# Aligning the Trace: Structurally Constant-Time Primality Testing against Misalignment Attacks
 
-This repository contains the source code, custom implementations, and benchmarking suites required to reproduce the experimental results presented in **Section 6** and **Appendix H** of our paper. It provides the tools to evaluate the correctness, performance, and side-channel resilience of our proposed natively branchless primality tests: **HVL** and **HVSS**.
+This repository contains the source code, custom implementations, and benchmarking suites required to reproduce the experimental results presented in **Section 6** our paper. It provides the tools to evaluate the correctness, performance, and side-channel resilience of our proposed primality tests: **HVL** and **HVSS**.
 
 ## 1. Overview of the Experiments
 
 As detailed in the paper, our experimental evaluation is divided into two primary domains to prove both the efficiency and the structural security of our architectures:
 
-1. **Performance and Correctness Verification (Section 6.1 & 6.2):** Evaluates the functional equivalence and execution latencies of our branchless implementations (HVL and HVSS) against the native OpenSSL Miller-Rabin (MR), a constant-time Miller-Rabin (MR-FP), and a constant-time Solovay-Strassen (SS) baseline. The outputs correspond directly to **Figure 2** and **Table 4** in the paper.
+1. **Performance and Correctness Verification (Section 6.1 & 6.2):** Evaluates the functional equivalence and execution latencies of our  implementations (HVL and HVSS) against the native OpenSSL Miller-Rabin (MR), a constant-time Miller-Rabin, and a constant-time Solovay-Strassen baseline. The outputs correspond directly to **Figure 2** and **Table 4** in the paper.
 2. **Constant-Time Leakage Assessment (Section 6.2):** Utilizes the `dudect` framework to rigorously verify the constant-time execution of our algorithms over 600,000 timing measurements. The tests assess three distinct leakage vectors (Fixed vs. Pool, Pool vs. Pool, Prime vs. Composite) to ensure the maximum Welch's t-statistic remains strictly within the +/- 4.5 safety threshold. This corresponds to **Figure 1** (ARM64) and **Figure 4** (x86_64).
 
 > **Prerequisite:** Before running any of the tests below, please ensure that you have successfully configured and compiled the modified OpenSSL library (`libcrypto.a`) in the root directory.
@@ -28,7 +28,7 @@ Run the compiled benchmark:
 ```bash
 ./test_prime_tests
 ```
-*The terminal output will display the absolute execution times (in microseconds) and the normalized performance overheads relative to the vulnerable baseline, directly reproducing the data for Table 4 and Figure 2.*
+*The terminal output will display the absolute execution times  and the normalized performance overheads relative to the vulnerable baseline, directly reproducing the data for Table 5 and Figure 2.*
 
 ---
 
@@ -54,9 +54,9 @@ Execute the side-channel test:
 
 ## 4. Cross-Platform Configuration (ARM64 vs. x86_64)
 
-To demonstrate that our branchless design's side-channel resilience is independent of specific microarchitectures, we evaluated it on both ARM64 and x86_64 platforms. 
+To demonstrate that our design's side-channel resilience is independent of specific microarchitectures, we evaluated it on both ARM64 and x86_64 platforms. 
 
-By default, the `dudect` environment in this repository is configured to read cycle counts for **ARM64** (e.g., Apple M-series processors). To reproduce the x86_64 evaluations presented in **Appendix H**, you must modify the CPU cycle counter configuration.
+By default, the `dudect` environment in this repository is configured to read cycle counts for **ARM64** (e.g., Apple M-series processors). 
 
 ### Switching to x86_64
 1. Open the file `dudect/src/cpucycles.h`.
@@ -72,7 +72,7 @@ static inline int64_t cpucycles(void) {
 }
 ```
 
-**For x86_64 (Appendix H Reproduction):**
+**For x86_64:**
 ```c
 static inline int64_t cpucycles(void) {
     unsigned int hi, lo;
