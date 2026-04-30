@@ -6,8 +6,8 @@ This repository contains the source code, custom implementations, and benchmarki
 
 As detailed in the paper, our experimental evaluation is divided into two primary domains to prove both the efficiency and the structural security of our architectures:
 
-1. **Performance and Correctness Verification (Section 6.1 & 6.2):** Evaluates the functional equivalence and execution latencies of our  implementations (HVL and HVSS) against the native OpenSSL Miller-Rabin (MR), a constant-time Miller-Rabin, and a constant-time Solovay-Strassen baseline. The outputs correspond directly to **Figure 2** and **Table 4** in the paper.
-2. **Constant-Time Leakage Assessment (Section 6.2):** Utilizes the `dudect` framework to rigorously verify the constant-time execution of our algorithms over 600,000 timing measurements. The tests assess three distinct leakage vectors (Fixed vs. Pool, Pool vs. Pool, Prime vs. Composite) to ensure the maximum Welch's t-statistic remains strictly within the +/- 4.5 safety threshold. This corresponds to **Figure 1** (ARM64) and **Figure 4** (x86_64).
+1. **Performance and Correctness Verification (Section 6.1 & 6.2):** Evaluates the functional equivalence and execution latencies of our  implementations (HVL and HVSS) against the native OpenSSL Miller-Rabin (MR), a constant-time Miller-Rabin, and a constant-time Solovay-Strassen baseline. The outputs correspond directly to **Figure 2** and **Table 5** in the paper.
+2. **Constant-Time Leakage Assessment (Section 6.2):** Utilizes the `dudect` framework to rigorously verify the constant-time execution of our algorithms over 600,000 timing measurements. The tests assess three distinct leakage vectors (Fixed vs. Pool, Pool vs. Pool, Prime vs. Composite) to ensure the maximum Welch's t-statistic remains strictly within the +/- 4.5 safety threshold. This corresponds to **Figure 1**.
 
 > **Prerequisite:** Before running any of the tests below, please ensure that you have successfully configured and compiled the modified OpenSSL library (`libcrypto.a`) in the root directory.
 
