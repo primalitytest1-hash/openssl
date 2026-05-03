@@ -81,4 +81,4 @@ static inline int64_t cpucycles(void) {
 }
 ```
 
-*After updating the cycle counter, recompile the `test_all_ct.c` binary on your x86_64 machine and execute it to reproduce the results in Figure 4.*
+*After updating the cycle counter, recompile the `test_all_ct.c` binary on your x86_64 machine and execute it to reproduce the results in Figure 1.*
