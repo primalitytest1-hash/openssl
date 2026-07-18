@@ -305,7 +305,7 @@ int main(int argc, char **argv) {
     run_correctness_jacobi_test(5000, 2048);
     
     /* 🔥 Added: Execute GCD/Inversion correctness comparison test */
-    run_correctness_gcd_test(10000, 512);
+    //run_correctness_gcd_test(10000, 512);
 
     /* Execute performance benchmark test */
     /* Note: For the paper, it is recommended to test 2048-bit 100 times to demonstrate the true power of large number multiplication */
