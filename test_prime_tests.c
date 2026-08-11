@@ -13,11 +13,14 @@
 
 /* Declare OpenSSL Internal Primality Testing Functions */
 extern int ossl_bn_CHVL_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
+extern int ossl_bn_CHVL_is_prime_random(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 extern int ossl_bn_miller_rabin_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int enhanced, int *status);
 extern int ossl_bn_solovay_strassen_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 
 /* 🔥 Declare the newly written Fully-Padded Constant-Time Miller-Rabin */
 extern int ossl_bn_miller_rabin_is_prime_unified(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
+extern int ossl_bn_CHVSS_is_prime_random(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
+
 
 /* 🔥🔥 Declare the latest CCS 2026 Hybrid Version (Amortized SS + Vset) */
 extern int ossl_bn_CHVSS_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
@@ -45,7 +48,11 @@ long long timeval_diff(struct timeval *start, struct timeval *end) {
 void run_correctness_test(int num_tests, int bits) {
     BN_CTX *ctx = BN_CTX_new();
     BIGNUM *w = BN_new();
-    int status_mr, status_mr_fp, status_lucas, status_ss, status_hybrid;
+    
+    /* 為每種實作宣告獨立的 status 變數 */
+    int status_mr, status_mr_fp, status_lucas, status_lucas_random;
+    int status_ss, status_hybrid, status_hybrid_random;
+    
     int match_count = 0, prime_count = 0;
 
     printf("==================================================\n");
@@ -61,30 +68,37 @@ void run_correctness_test(int num_tests, int bits) {
         /* Call Fully-Padded CT Miller-Rabin (64 iterations) */
         ossl_bn_miller_rabin_is_prime_unified(w, 64, ctx, NULL, &status_mr_fp);
 
-        /* Call the CHVL Lucas test (66 iterations) */
+        /* Call the CHVL Lucas test (fixed list & random fallback) (66 iterations) */
         ossl_bn_CHVL_is_prime(w, 66, ctx, NULL, &status_lucas);
+        ossl_bn_CHVL_is_prime_random(w, 66, ctx, NULL, &status_lucas_random);
 
         /* Call Solovay-Strassen test (128 iterations) */
         ossl_bn_solovay_strassen_is_prime(w, 128, ctx, NULL, &status_ss);
 
-        /* Call the latest Hybrid SS+Vset test (68 iterations: 7 SS + 61 Vset) */
+        /* Call the Hybrid SS+Vset test (fixed list & random fallback) (68 iterations) */
         ossl_bn_CHVSS_is_prime(w, 68, ctx, NULL, &status_hybrid);
+        ossl_bn_CHVSS_is_prime_random(w, 68, ctx, NULL, &status_hybrid_random);
 
-        /* Verify if all five results match perfectly */
-        int is_prime_mr      = (status_mr == BN_PRIMETEST_PROBABLY_PRIME);
-        int is_prime_mr_fp   = (status_mr_fp == BN_PRIMETEST_PROBABLY_PRIME);
-        int is_prime_lucas   = (status_lucas == BN_PRIMETEST_PROBABLY_PRIME);
-        int is_prime_ss      = (status_ss == BN_PRIMETEST_PROBABLY_PRIME);
-        int is_prime_hybrid  = (status_hybrid == BN_PRIMETEST_PROBABLY_PRIME);
+        /* Verify if all SEVEN results match perfectly */
+        int is_prime_mr             = (status_mr == BN_PRIMETEST_PROBABLY_PRIME);
+        int is_prime_mr_fp          = (status_mr_fp == BN_PRIMETEST_PROBABLY_PRIME);
+        int is_prime_lucas          = (status_lucas == BN_PRIMETEST_PROBABLY_PRIME);
+        int is_prime_lucas_random   = (status_lucas_random == BN_PRIMETEST_PROBABLY_PRIME);
+        int is_prime_ss             = (status_ss == BN_PRIMETEST_PROBABLY_PRIME);
+        int is_prime_hybrid         = (status_hybrid == BN_PRIMETEST_PROBABLY_PRIME);
+        int is_prime_hybrid_random  = (status_hybrid_random == BN_PRIMETEST_PROBABLY_PRIME);
 
-        if ((is_prime_mr != is_prime_lucas) || 
+        if ((is_prime_mr != is_prime_mr_fp) || 
+            (is_prime_mr != is_prime_lucas) || 
+            (is_prime_mr != is_prime_lucas_random) || 
             (is_prime_mr != is_prime_ss) || 
-            (is_prime_mr != is_prime_mr_fp) || 
-            (is_prime_mr != is_prime_hybrid)) {
+            (is_prime_mr != is_prime_hybrid) ||
+            (is_prime_mr != is_prime_hybrid_random)) {
             
             printf("[FAILED] Mismatch found!\n");
-            printf("MR says: %d, MR-FP says: %d, Lucas says: %d, SS says: %d, Hybrid says: %d\n", 
-                   is_prime_mr, is_prime_mr_fp, is_prime_lucas, is_prime_ss, is_prime_hybrid);
+            printf("MR: %d, MR-FP: %d, Lucas: %d, Lucas-Rand: %d, SS: %d, Hybrid: %d, Hybrid-Rand: %d\n", 
+                   is_prime_mr, is_prime_mr_fp, is_prime_lucas, is_prime_lucas_random, 
+                   is_prime_ss, is_prime_hybrid, is_prime_hybrid_random);
             char *w_str = BN_bn2hex(w);
             printf("Failed Number: %s\n", w_str);
             OPENSSL_free(w_str);
@@ -95,7 +109,7 @@ void run_correctness_test(int num_tests, int bits) {
         match_count++;
     }
 
-    printf("[SUCCESS] All %d tests matched perfectly. Found %d primes.\n", match_count, prime_count);
+    printf("[SUCCESS] All %d tests matched perfectly across 7 implementations. Found %d primes.\n", match_count, prime_count);
     
     BN_free(w);
     BN_CTX_free(ctx);
@@ -107,17 +121,22 @@ void run_performance_benchmark(int num_tests, int bits) {
     BIGNUM *w = BN_new();
     int status;
     struct timeval start, end;
-    long long time_mr = 0, time_mr_fp = 0, time_lucas = 0, time_ss = 0, time_hybrid = 0;
+    long long time_mr = 0, time_mr_fp = 0, time_ss = 0;
+    long long time_lucas = 0, time_lucas_random = 0;
+    long long time_hybrid = 0, time_hybrid_random = 0;
 
     printf("\n==================================================\n");
     printf("2. Starting performance benchmark (%d inputs, %d-bit)...\n", num_tests, bits);
     printf("   (Aligned to 2^-128 security level)\n");
     printf("   - MR (Baseline)    : 64 iters\n");
     printf("   - SS (Pure)        : 128 iters\n");
-    printf("   - CHVL   : 66 iters\n");
-    printf("   - CHVSS : 68 iters (7 SS + 61 Vset)\n");
+    printf("   - CHVL (Fixed)     : 66 iters\n");
+    printf("   - CHVL (Random)    : 66 iters\n");
+    printf("   - CHVSS (Fixed)    : 68 iters (7 SS + 61 Vset)\n");
+    printf("   - CHVSS (Random)   : 68 iters (7 SS + 61 Vset)\n");
     printf("--------------------------------------------------\n");
 
+    /* 使用一個質數來測量最壞情況（ Worst-case，所有迴圈都會跑滿）的效能 */
     BN_generate_prime_ex(w, bits, 0, NULL, NULL, NULL);
 
     gettimeofday(&start, NULL);
@@ -143,6 +162,13 @@ void run_performance_benchmark(int num_tests, int bits) {
 
     gettimeofday(&start, NULL);
     for (int i = 0; i < num_tests; i++) {
+        ossl_bn_CHVL_is_prime_random(w, 66, ctx, NULL, &status);
+    }
+    gettimeofday(&end, NULL);
+    time_lucas_random = timeval_diff(&start, &end);
+
+    gettimeofday(&start, NULL);
+    for (int i = 0; i < num_tests; i++) {
         ossl_bn_solovay_strassen_is_prime(w, 128, ctx, NULL, &status);
     }
     gettimeofday(&end, NULL);
@@ -155,19 +181,30 @@ void run_performance_benchmark(int num_tests, int bits) {
     gettimeofday(&end, NULL);
     time_hybrid = timeval_diff(&start, &end);
 
+    gettimeofday(&start, NULL);
+    for (int i = 0; i < num_tests; i++) {
+        ossl_bn_CHVSS_is_prime_random(w, 68, ctx, NULL, &status);
+    }
+    gettimeofday(&end, NULL);
+    time_hybrid_random = timeval_diff(&start, &end);
+
     printf("--- Benchmark Results (Total Microseconds) ---\n");
-    printf("Miller-Rabin (Raw): %lld us\n", time_mr);
-    printf("Miller-Rabin (FP) : %lld us\n", time_mr_fp);
-    printf("Solovay-Strass.   : %lld us\n", time_ss);
-    printf("CHVL Time : %lld us\n", time_lucas);
-    printf("CHVSS Time  : %lld us\n", time_hybrid);
+    printf("Miller-Rabin (Raw) : %lld us\n", time_mr);
+    printf("Miller-Rabin (FP)  : %lld us\n", time_mr_fp);
+    printf("Solovay-Strass.    : %lld us\n", time_ss);
+    printf("CHVL (Fixed)       : %lld us\n", time_lucas);
+    printf("CHVL (Random)      : %lld us\n", time_lucas_random);
+    printf("CHVSS (Fixed)      : %lld us\n", time_hybrid);
+    printf("CHVSS (Random)     : %lld us\n", time_hybrid_random);
     
     printf("\n--- Performance Overheads (Normalized to Raw MR) ---\n");
-    printf("MR (Baseline)     : 1.00x\n");
-    printf("MR (Unified FP)   : %.2fx\n", (double)time_mr_fp / time_mr);
-    printf("Solovay-Strassen  : %.2fx\n", (double)time_ss / time_mr);
-    printf("CHVL    : %.2fx\n", (double)time_lucas / time_mr);
-    printf("CHVSS  : %.2fx\n", (double)time_hybrid / time_mr);
+    printf("MR (Baseline)      : 1.00x\n");
+    printf("MR (Unified FP)    : %.2fx\n", (double)time_mr_fp / time_mr);
+    printf("Solovay-Strassen   : %.2fx\n", (double)time_ss / time_mr);
+    printf("CHVL (Fixed)       : %.2fx\n", (double)time_lucas / time_mr);
+    printf("CHVL (Random)      : %.2fx\n", (double)time_lucas_random / time_mr);
+    printf("CHVSS (Fixed)      : %.2fx\n", (double)time_hybrid / time_mr);
+    printf("CHVSS (Random)     : %.2fx\n", (double)time_hybrid_random / time_mr);
     printf("==================================================\n");
 
     BN_free(w);

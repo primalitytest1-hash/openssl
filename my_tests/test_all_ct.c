@@ -46,9 +46,11 @@ extern int ossl_bn_miller_rabin_is_prime(const BIGNUM *w, int iterations, BN_CTX
 
 /* Other algorithm declarations */
 extern int ossl_bn_CHVL_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
+extern int ossl_bn_CHVL_is_prime_random(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 extern int ossl_bn_solovay_strassen_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 extern int ossl_bn_miller_rabin_is_prime_unified(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 extern int ossl_bn_CHVSS_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
+extern int ossl_bn_CHVSS_is_prime_random(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 
 #define BIT_LENGTH 1024         
 #define PRIME_POOL_SIZE 1000   
@@ -65,7 +67,17 @@ BIGNUM *prime_pool[PRIME_POOL_SIZE];
 BIGNUM *composite_pool[PRIME_POOL_SIZE]; 
 BIGNUM **input_x_array;
 
-int test_mode = 0; // 0: CHVL, 1: mrunified, 2: CHVSS, 3: ss, 4: mr (native)
+/*
+ * test_mode:
+ * 0: CHVL (Fixed)
+ * 1: mrunified
+ * 2: CHVSS (Fixed)
+ * 3: ss
+ * 4: mr (native)
+ * 5: CHVL_rand (Randomized fallback)
+ * 6: CHVSS_rand (Randomized fallback)
+ */
+int test_mode = 0; 
 int eval_type = 0; // 0: fixed, 1: pool, 2: composite
 
 /* --- Dataset access functions --- */
@@ -151,16 +163,18 @@ uint8_t do_one_computation(uint8_t *data) {
     
     if (test_mode == 0) ossl_bn_CHVL_is_prime(input_x_array[index], 66, bn_ctx, NULL, &status);
     else if (test_mode == 1) ossl_bn_miller_rabin_is_prime_unified(input_x_array[index], 64, bn_ctx, NULL, &status);
-    else if (test_mode == 2) ossl_bn_CHVSS_is_prime(input_x_array[index], 69, bn_ctx, NULL, &status);
+    else if (test_mode == 2) ossl_bn_CHVSS_is_prime(input_x_array[index], 68, bn_ctx, NULL, &status);
     else if (test_mode == 3) ossl_bn_solovay_strassen_is_prime(input_x_array[index], 128, bn_ctx, NULL, &status);
     else if (test_mode == 4) ossl_bn_miller_rabin_is_prime(input_x_array[index], 64, bn_ctx, NULL, 0, &status);
+    else if (test_mode == 5) ossl_bn_CHVL_is_prime_random(input_x_array[index], 66, bn_ctx, NULL, &status);
+    else if (test_mode == 6) ossl_bn_CHVSS_is_prime_random(input_x_array[index], 68, bn_ctx, NULL, &status);
 
     return 0;
 }
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
-        printf("Usage: %s [CHVL|mrunified|CHVSS|ss|mr] [fixed|pool|composite]\n", argv[0]);
+        printf("Usage: %s [CHVL|CHVL_rand|mrunified|CHVSS|CHVSS_rand|ss|mr] [fixed|pool|composite]\n", argv[0]);
         return 1;
     }
 
@@ -169,10 +183,20 @@ int main(int argc, char *argv[]) {
     else if (strcmp(argv[1], "CHVSS") == 0) test_mode = 2;
     else if (strcmp(argv[1], "ss") == 0) test_mode = 3;
     else if (strcmp(argv[1], "mr") == 0) test_mode = 4;
+    else if (strcmp(argv[1], "CHVL_rand") == 0 || strcmp(argv[1], "CHVL_random") == 0) test_mode = 5;
+    else if (strcmp(argv[1], "CHVSS_rand") == 0 || strcmp(argv[1], "CHVSS_random") == 0) test_mode = 6;
+    else {
+        printf("Unknown algorithm: %s\n", argv[1]);
+        return 1;
+    }
 
     if (strcmp(argv[2], "fixed") == 0) eval_type = 0;
     else if (strcmp(argv[2], "pool") == 0) eval_type = 1;
     else if (strcmp(argv[2], "composite") == 0) eval_type = 2;
+    else {
+        printf("Unknown evaluation type: %s\n", argv[2]);
+        return 1;
+    }
 
     bn_ctx = BN_CTX_new();
     fixed_prime = BN_new();
