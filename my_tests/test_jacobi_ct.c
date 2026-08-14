@@ -7,7 +7,7 @@
 #define DUDECT_IMPLEMENTATION
 #include "dudect/src/dudect.h"
 
-/* 🔥 Declare your Jacobi implementation */
+/* Declare your Jacobi implementation */
 extern int ossl_bn_jacobi_by(const BIGNUM *a, const BIGNUM *n, BN_CTX *ctx);
 
 /* Test parameter configurations */
@@ -62,7 +62,7 @@ void prepare_inputs(dudect_config_t *c, uint8_t *input_data, uint8_t *classes) {
 uint8_t do_one_computation(uint8_t *data) {
     size_t index = *(size_t *)data;
     
-    /* 🚨 Call Jacobi implementation: (fixed_base_a / input_x_array[index]) */
+    /* Call Jacobi implementation: (fixed_base_a / input_x_array[index]) */
     ossl_bn_jacobi_by(fixed_base_a, input_x_array[index], bn_ctx);
     
     return 0;

@@ -1180,7 +1180,6 @@ static int ct_random_in_range(BIGNUM *out, const BIGNUM *n, BN_ULONG sub_from_n,
     sub_bn = BN_CTX_get(ctx); add_bn = BN_CTX_get(ctx);
     pad_n = BN_CTX_get(ctx); 
     
-    /* 【修正 2】：嚴格檢查記憶體分配，防止 OOM 導致崩潰 */
     if (pad_n == NULL) goto err;
 
     if (bn_wexpand(M, top_w) == NULL) goto err;
@@ -2068,8 +2067,7 @@ int ossl_bn_CHVSS_is_prime_random(const BIGNUM *w, int iterations, BN_CTX *ctx,
             bn_wexpand(batch_inv[k], top_w); ct_pad_top(batch_inv[k], top_w);
         }
 
-        /* --- Crucial Optimization: Batch invert for all Trace iterations --- */
-        
+        /* --- Batch invert for all Trace iterations --- */
         /* Step A: P <- Sample_Array(I_Vset, [0, n-1]) */
         for (int k = 0; k < vset_iters; k++) {
             if (!ct_random_in_range(batch_P[k], w_ct, 0, 0, top_w, ctx)) goto err;

@@ -17,24 +17,24 @@ extern int ossl_bn_CHVL_is_prime_random(const BIGNUM *w, int iterations, BN_CTX 
 extern int ossl_bn_miller_rabin_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int enhanced, int *status);
 extern int ossl_bn_solovay_strassen_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 
-/* 🔥 Declare the newly written Fully-Padded Constant-Time Miller-Rabin */
+/* Declare the newly written Fully-Padded Constant-Time Miller-Rabin */
 extern int ossl_bn_miller_rabin_is_prime_unified(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 extern int ossl_bn_CHVSS_is_prime_random(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 
 
-/* 🔥🔥 Declare the latest CCS 2026 Hybrid Version (Amortized SS + Vset) */
+/* Declare the latest CCS 2026 Hybrid Version (Amortized SS + Vset) */
 extern int ossl_bn_CHVSS_is_prime(const BIGNUM *w, int iterations, BN_CTX *ctx, BN_GENCB *cb, int *status);
 
-/* 🔥🔥🔥 Declare OpenSSL built-in and the newly written Constant-Time Jacobi */
+/* Declare OpenSSL built-in and the newly written Constant-Time Jacobi */
 extern int BN_kronecker(const BIGNUM *a, const BIGNUM *b, BN_CTX *ctx);
 extern int ossl_bn_jacobi_by(const BIGNUM *x_in, const BIGNUM *y_in, BN_CTX *ctx);
 
-/* 🔥🔥🔥 Declare the Constant-Time Binary GCD (Extracted from Lucas Test) */
+/* Declare the Constant-Time Binary GCD (Extracted from Lucas Test) */
 extern void ct_by_invert(BIGNUM *out, const BIGNUM *x, const BIGNUM *m, int top_w, BN_CTX *ctx);
 extern void ct_by_gcd_inv(BIGNUM *out_inv, BIGNUM *out_gcd, const BIGNUM *x, const BIGNUM *m, int top_w, BN_CTX *ctx);
 
 
-/* 🛠️ Supplement missing OpenSSL internal function declarations (for BIGNUM memory manipulation) */
+/* Supplement missing OpenSSL internal function declarations (for BIGNUM memory manipulation) */
 extern BIGNUM *bn_wexpand(BIGNUM *a, int words);
 extern void bn_correct_top(BIGNUM *a);
 
@@ -136,7 +136,6 @@ void run_performance_benchmark(int num_tests, int bits) {
     printf("   - CHVSS (Random)   : 68 iters (7 SS + 61 Vset)\n");
     printf("--------------------------------------------------\n");
 
-    /* 使用一個質數來測量最壞情況（ Worst-case，所有迴圈都會跑滿）的效能 */
     BN_generate_prime_ex(w, bits, 0, NULL, NULL, NULL);
 
     gettimeofday(&start, NULL);
@@ -280,7 +279,7 @@ void run_correctness_gcd_test(int num_tests, int bits) {
          * Note: We need to expand a and b to the same top_w before feeding to ct_by_invert */
         int top_w = (bits + BN_BITS2 - 1) / BN_BITS2;
         
-        /* 🚀 Fix Segfault: Pre-allocate all internal arrays to the required length! */
+        /* Fix Segfault: Pre-allocate all internal arrays to the required length! */
         bn_wexpand(a, top_w);
         bn_wexpand(b, top_w);
         bn_wexpand(gcd_ct, top_w); 

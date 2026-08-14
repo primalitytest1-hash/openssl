@@ -7,7 +7,7 @@
 #define DUDECT_IMPLEMENTATION
 #include "dudect/src/dudect.h"
 
-/* 🔥 Declare your GCD/Inversion implementation and memory expansion tool */
+/* Declare your GCD/Inversion implementation and memory expansion tool */
 extern void ct_by_gcd_inv(BIGNUM *out_inv, BIGNUM *out_gcd, const BIGNUM *x, const BIGNUM *m, int top_w, BN_CTX *ctx);
 extern BIGNUM *bn_wexpand(BIGNUM *a, int words);
 
@@ -72,7 +72,7 @@ void prepare_inputs(dudect_config_t *c, uint8_t *input_data, uint8_t *classes) {
 uint8_t do_one_computation(uint8_t *data) {
     size_t index = *(size_t *)data;
     
-    /* 🚨 Call the latest Constant-Time Binary GCD/Inversion implementation */
+    /* Call the latest Constant-Time Binary GCD/Inversion implementation */
     ct_by_gcd_inv(out_inv, out_gcd, fixed_base_a, input_x_array[index], top_w, bn_ctx);
     
     return 0;
