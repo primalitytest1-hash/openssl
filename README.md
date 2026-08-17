@@ -1,4 +1,4 @@
-# Aligning the Trace: Structurally Constant-Time Primality Testing against Misalignment Attacks
+# Fixed-Depth Lucas Primality Testing with Near-MR Soundness
 
 This repository contains the source code, custom implementations, and benchmarking suites required to reproduce the experimental results presented in **Section 6** our paper. It provides the tools to evaluate the correctness, performance, and side-channel resilience of our proposed primality tests: **HVL** and **HVSS**.
 

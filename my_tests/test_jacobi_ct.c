@@ -27,7 +27,7 @@ BIGNUM *fixed_base_a;              /* Fixed numerator a */
 int eval_mode = 2; /* 0: fixed, 1: pool, 2: composite (default) */
 
 /*
- * 🛠️ Sampling preparation function supporting three modes
+ * Sampling preparation function supporting three modes
  */
 void prepare_inputs(dudect_config_t *c, uint8_t *input_data, uint8_t *classes) {
     randombytes(classes, c->number_measurements);

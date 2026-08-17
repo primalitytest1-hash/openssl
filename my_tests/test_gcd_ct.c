@@ -31,7 +31,7 @@ int top_w;                         /* Global memory length (number of limbs) */
 int eval_mode = 2; /* 0: fixed, 1: pool, 2: composite (default) */
 
 /*
- * 🛠️ Sampling preparation function supporting three modes (Preparation phase is excluded from timing)
+ * Sampling preparation function supporting three modes (Preparation phase is excluded from timing)
  */
 void prepare_inputs(dudect_config_t *c, uint8_t *input_data, uint8_t *classes) {
     randombytes(classes, c->number_measurements);
@@ -67,7 +67,7 @@ void prepare_inputs(dudect_config_t *c, uint8_t *input_data, uint8_t *classes) {
 }
 
 /*
- * ⏱️ Actual timed section: Keep it as clean as possible, only the algorithm itself should be present
+ * Actual timed section: Keep it as clean as possible, only the algorithm itself should be present
  */
 uint8_t do_one_computation(uint8_t *data) {
     size_t index = *(size_t *)data;
