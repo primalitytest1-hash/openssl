@@ -22,3 +22,64 @@ This suite executes the functional equivalence verifications across all five alg
 Navigate to the root directory of the repository and compile the benchmark harness:
 ```bash
 gcc -O2 test_prime_tests.c -I./include ./libcrypto.a -lpthread -ldl -o test_prime_tests
+```
+
+### Execution
+Run the compiled benchmark:
+```bash
+./test_prime_tests
+```
+*The terminal output will display the absolute execution times  and the normalized performance overheads relative to the vulnerable baseline, directly reproducing the data for Table 5 and Figure 2.*
+
+---
+
+## 3. Constant-Time Leakage Assessment (dudect)
+
+We integrate the `dudect` framework to perform rigorous side-channel leakage assessments. 
+
+### Compilation
+Navigate to the `my_tests` directory and compile the leakage assessment tool:
+```bash
+cd my_tests/
+gcc -O2 test_all_ct.c -o test_all_ct -I../include -I./dudect/src ../libcrypto.a -lm
+```
+
+### Execution
+Execute the side-channel test:
+```bash
+./test_all_ct
+```
+*The tool will compute Welch's t-test statistic. A maximum t-statistic value of `< 4.5` indicates no statistically significant timing leakage.*
+
+---
+
+## 4. Cross-Platform Configuration (ARM64 vs. x86_64)
+
+To demonstrate that our design's side-channel resilience is independent of specific microarchitectures, we evaluated it on both ARM64 and x86_64 platforms. 
+
+By default, the `dudect` environment in this repository is configured to read cycle counts for **ARM64** (e.g., Apple M-series processors). 
+
+### Switching to x86_64
+1. Open the file `dudect/src/cpucycles.h`.
+2. Locate the `cpucycles()` function definition.
+3. Replace the ARM64 inline assembly with the x86_64 `rdtsc` instruction implementation.
+
+**For ARM64 (Default):**
+```c
+static inline int64_t cpucycles(void) {
+    int64_t val;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+}
+```
+
+**For x86_64:**
+```c
+static inline int64_t cpucycles(void) {
+    unsigned int hi, lo;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((int64_t)lo) | (((int64_t)hi) << 32);
+}
+```
+
+*After updating the cycle counter, recompile the `test_all_ct.c` binary on your x86_64 machine and execute it to reproduce the results in Figure 1.*
